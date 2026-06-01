@@ -1,0 +1,83 @@
+@import url("https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 190 48% 97%;
+    --foreground: 194 58% 18%;
+    --card: 0 0% 100%;
+    --card-foreground: 194 58% 18%;
+    --primary: 190 91% 32%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 188 86% 92%;
+    --secondary-foreground: 194 58% 18%;
+    --muted: 190 33% 94%;
+    --muted-foreground: 195 18% 40%;
+    --accent: 187 61% 91%;
+    --accent-foreground: 194 58% 18%;
+    --destructive: 8 76% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 190 28% 85%;
+    --input: 190 28% 82%;
+    --ring: 190 91% 32%;
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    min-width: 0;
+    background: hsl(var(--background));
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    margin: 0;
+    min-width: 0;
+    font-family: "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
+  }
+
+  button,
+  [role="button"] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+}
+
+@layer components {
+  .ops-shell {
+    background:
+      linear-gradient(180deg, rgba(236, 254, 255, 0.98), rgba(248, 250, 252, 0.98)),
+      repeating-linear-gradient(90deg, rgba(8, 145, 178, 0.045) 0, rgba(8, 145, 178, 0.045) 1px, transparent 1px, transparent 36px);
+  }
+
+  .field-label {
+    @apply mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground;
+  }
+
+  .metric-card {
+    @apply rounded-lg border border-border bg-card px-4 py-3 shadow-sm;
+  }
+
+  .step-line {
+    @apply relative pl-7;
+  }
+
+  .step-line::before {
+    content: "";
+    @apply absolute left-[11px] top-8 h-[calc(100%-2rem)] w-px bg-border;
+  }
+
+  .step-line:last-child::before {
+    display: none;
+  }
+}

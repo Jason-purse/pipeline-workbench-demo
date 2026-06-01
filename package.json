@@ -1,0 +1,95 @@
+{
+  "name": "hospital-release-workbench-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local MVP workbench for hospital build and release operations.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "vite --host 0.0.0.0 --config vite.config.js",
+    "electron": "npm run build && electron electron/main.cjs",
+    "electron:check": "node scripts/check-electron-package.cjs",
+    "electron:smoke": "npm run build && node scripts/run-electron-node-smoke.cjs",
+    "electron:pack": "npm run build && electron-builder --dir",
+    "electron:pack:win": "npm run build && electron-builder --win dir --x64",
+    "prebuild": "node scripts/clean-vite-assets.cjs",
+    "build": "vite build --config vite.config.js",
+    "check": "node --check src/server.js && node --check src/lib/crypto.js && node --check src/lib/platform-client.js && node --check src/data/profiles.js && node --check src/data/tasks.js && node --check electron/main.cjs && node --check scripts/check-electron-package.cjs && node --check scripts/electron-node-smoke.cjs && node --check scripts/run-electron-node-smoke.cjs && node --check scripts/clean-vite-assets.cjs && node --check src/client/src/lib/service-pagination.mjs && node --check src/client/src/lib/task-reuse.mjs && node --check src/client/src/lib/pipeline-observer.mjs && node --check src/client/src/lib/pipeline-run-store.mjs && node --check src/client/src/lib/workflow-environments.mjs && node --check public/pipeline-core.js && node --check public/pipeline-adapters.js && node --check public/run-store.js && node --check public/app.js && node scripts/check-pipeline-core.js && node scripts/check-task-reuse.js && node scripts/check-service-pagination.mjs && node scripts/check-client-task-reuse.mjs && node scripts/check-pipeline-observer.mjs && node scripts/check-pipeline-run-store.mjs && node scripts/check-workbench-ui-semantics.mjs && node scripts/check-platform-client.js && node scripts/check-workflow-config.js && node scripts/check-workflow-environments.mjs && npm run electron:check && npm run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@radix-ui/react-progress": "^1.1.0",
+    "@radix-ui/react-scroll-area": "^1.2.2",
+    "@radix-ui/react-select": "^2.1.4",
+    "@radix-ui/react-separator": "^1.1.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-tabs": "^1.1.1",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.20",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3",
+    "lucide-react": "^0.468.0",
+    "postcss": "^8.4.49",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss": "^3.4.17",
+    "vite": "^4.5.3"
+  },
+  "build": {
+    "appId": "com.ewell.pipeline-workbench",
+    "productName": "Pipeline Workbench",
+    "asar": true,
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/main.cjs",
+      "src/server.js",
+      "src/lib/crypto.js",
+      "src/lib/platform-client.js",
+      "src/data/profiles.js",
+      "src/data/tasks.js",
+      "public/**/*",
+      "package.json",
+      "!node_modules/**",
+      "!**/.workbench-secrets.json",
+      "!**/.workbench-cache/**",
+      "!**/.env"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.cjs"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development"
+    }
+  }
+}
