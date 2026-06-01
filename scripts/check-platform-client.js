@@ -153,10 +153,15 @@ assert.doesNotMatch(
   /const taskRows = allTaskRows\.slice/,
   "selectBuildTask already receives pageNumber/pageSize; the wrapper must not slice that server page again"
 );
-assert.doesNotMatch(
+assert.match(
   platformClientSource,
-  /selectPublishMicroServiceInfo[\s\S]{0,260}pageNumber/,
-  "service discovery is not a real paged platform API; Workbench must fetch the customer/application service set and page it locally"
+  /const firstPayload = \{[\s\S]{0,180}pageNumber:\s*1,[\s\S]{0,120}pageSize:\s*SERVICE_PAGE_SIZE/,
+  "service discovery must explicitly request a large first platform page instead of accepting the platform's default 10 rows"
+);
+assert.match(
+  platformClientSource,
+  /for \(let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber \+= 1\)[\s\S]{0,700}pageSize:\s*SERVICE_PAGE_SIZE/,
+  "service discovery must continue fetching platform pages until the customer/application service set is complete or the page budget is exhausted"
 );
 assert.match(
   platformClientSource,

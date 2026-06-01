@@ -1178,26 +1178,45 @@ function serviceRowMatchesQuery(row, query) {
 }
 
 function fetchPublishMicroServices(session, payload) {
+  const firstPayload = {
+    ...payload,
+    pageNumber: 1,
+    pageSize: SERVICE_PAGE_SIZE
+  };
   const response = postJsonViaNode(
     `${platforms.build.apiBase}/support/selectPublishMicroServiceInfo`,
-    createWrapper(payload),
+    createWrapper(firstPayload),
     session.cookieJar
   );
   const responseObject = objectOf(response);
   const rows = arrayOf(responseObject);
   const total = Number(responseObject && responseObject.total) || rows.length;
+  const { totalPages, pagesToFetch, hasMore } = boundedPageCount(total, SERVICE_PAGE_SIZE, SERVICE_MAX_PAGES);
+
+  for (let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber += 1) {
+    const pageResponse = postJsonViaNode(
+      `${platforms.build.apiBase}/support/selectPublishMicroServiceInfo`,
+      createWrapper({
+        ...payload,
+        pageNumber,
+        pageSize: SERVICE_PAGE_SIZE
+      }),
+      session.cookieJar
+    );
+    rows.push(...arrayOf(objectOf(pageResponse)));
+  }
 
   return {
     total,
     pageNo: 1,
-    pageSize: rows.length,
-    totalPages: 1,
-    pagesFetched: 1,
-    hasMore: false,
+    pageSize: SERVICE_PAGE_SIZE,
+    totalPages,
+    pagesFetched: pagesToFetch,
+    hasMore,
     rows,
     status: response.json && response.json.status,
     error: response.json && response.json.error,
-    serverPaged: false
+    serverPaged: true
   };
 }
 

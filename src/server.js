@@ -2,37 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const { customWorkflowAccounts, environmentLinksForReleaseEnvironments, getProfile, materializeProfiles, platforms } = require("./data/profiles");
-const { stateLabels, tasks } = require("./data/tasks");
-const {
-  executeBuildPlatformPublish,
-  executeBuildImages,
-  executeBuildTask,
-  executePublishApps,
-  discoverBuildWorkflowCustomers,
-  getCurrentAppPublishDetail,
-  listBuildTasks,
-  probeBuildApply,
-  probeBuildPlatform,
-  probeImageVersion,
-  probeStructureTypeConfigs,
-  probeBuildServiceDetail,
-  probeReleasePlatform,
-  verifyTaskBuildPermission
-} = require("./lib/platform-client");
-
-const PORT = Number(process.env.PORT || 4173);
-const PUBLIC_DIR = path.join(__dirname, "..", "public");
 const ENV_PATH = path.join(__dirname, "..", ".env");
-const SECRETS_PATH = process.env.WORKBENCH_SECRETS_PATH || path.join(__dirname, "..", ".workbench-secrets.json");
-
-const contentTypes = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml"
-};
 
 function loadDotEnv(filePath = ENV_PATH) {
   if (!fs.existsSync(filePath)) return;
@@ -54,6 +24,37 @@ function loadDotEnv(filePath = ENV_PATH) {
 }
 
 loadDotEnv();
+
+const { customWorkflowAccounts, environmentLinksForReleaseEnvironments, getProfile, materializeProfiles, platforms } = require("./data/profiles");
+const { stateLabels, tasks } = require("./data/tasks");
+const {
+  executeBuildPlatformPublish,
+  executeBuildImages,
+  executeBuildTask,
+  executePublishApps,
+  discoverBuildWorkflowCustomers,
+  getCurrentAppPublishDetail,
+  listBuildTasks,
+  probeBuildApply,
+  probeBuildPlatform,
+  probeImageVersion,
+  probeStructureTypeConfigs,
+  probeBuildServiceDetail,
+  probeReleasePlatform,
+  verifyTaskBuildPermission
+} = require("./lib/platform-client");
+
+const PORT = Number(process.env.PORT || 4173);
+const PUBLIC_DIR = path.join(__dirname, "..", "public");
+const SECRETS_PATH = process.env.WORKBENCH_SECRETS_PATH || path.join(__dirname, "..", ".workbench-secrets.json");
+
+const contentTypes = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml"
+};
 
 function readSecrets() {
   if (!fs.existsSync(SECRETS_PATH)) return {};

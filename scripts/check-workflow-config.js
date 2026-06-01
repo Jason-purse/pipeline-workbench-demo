@@ -32,6 +32,11 @@ assert.match(
   "server bootstrap must return materialized profiles including dynamic workflow accounts"
 );
 assert.match(
+  serverSource,
+  /loadDotEnv\(\);[\s\S]{0,260}require\("\.\/data\/profiles"\)/,
+  "server must load .env before importing platform profile config so runtime platform hosts are not frozen to demo defaults"
+);
+assert.match(
   profileSource,
   /hiddenWorkflowProfileIds/,
   "default workflows hidden locally by the user must remain hidden in materialized profiles"
