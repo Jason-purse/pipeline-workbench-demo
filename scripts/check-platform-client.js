@@ -155,13 +155,18 @@ assert.doesNotMatch(
 );
 assert.match(
   platformClientSource,
-  /const firstPayload = \{[\s\S]{0,180}pageNumber:\s*1,[\s\S]{0,120}pageSize:\s*SERVICE_PAGE_SIZE/,
-  "service discovery must explicitly request a large first platform page instead of accepting the platform's default 10 rows"
+  /fetchPublishMicroServices\(session,\s*\{[\s\S]{0,220}\},\s*\{[\s\S]{0,180}pageNumber:\s*servicePageNumber,[\s\S]{0,120}pageSize:\s*servicePageSize,[\s\S]{0,120}serviceSearch/,
+  "service discovery must pass the requested service page and search term to the platform API"
 );
 assert.match(
   platformClientSource,
-  /for \(let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber \+= 1\)[\s\S]{0,700}pageSize:\s*SERVICE_PAGE_SIZE/,
-  "service discovery must continue fetching platform pages until the customer/application service set is complete or the page budget is exhausted"
+  /imageJenkinsName:\s*serviceSearch \|\| undefined,[\s\S]{0,120}pageNumber,[\s\S]{0,80}pageSize/,
+  "service discovery search must use the original platform field imageJenkinsName together with pageNumber/pageSize"
+);
+assert.doesNotMatch(
+  platformClientSource,
+  /for \(let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber \+= 1\)[\s\S]{0,700}selectPublishMicroServiceInfo/,
+  "service discovery must not hide platform pagination by fetching every page before returning to the UI"
 );
 assert.match(
   platformClientSource,
@@ -187,6 +192,75 @@ assert.match(
   platformClientSource,
   /requestedImagesFromPermissionOptions/,
   "multi-service task permission checks must build the requested service group from buildImages/images"
+);
+
+const recure = {
+  imageJenkinsName: "recure-emr-ewell-mastertest",
+  imageNameEn: "recure-emr-ewell",
+  imageVersion: "v2.49.002",
+  imageDeployId: "recure-deploy"
+};
+const recureweb = {
+  imageJenkinsName: "recureweb-emr-ewell-mastertest",
+  imageNameEn: "recureweb-emr-ewell",
+  imageVersion: "v1.94.002",
+  imageDeployId: "recureweb-deploy"
+};
+const unrelated = {
+  imageJenkinsName: "legacy-emr-ewell-mastertest",
+  imageNameEn: "legacy-emr-ewell",
+  imageVersion: "v9.9.001"
+};
+const editableDuplicate = _internals.recoverableDuplicateBuildApplyGroup([
+  {
+    task: { id: "apply-extra", pendingApply: true, applyStatus: "0" },
+    images: [recure, unrelated]
+  }
+], [recure, recureweb]);
+assert.equal(
+  editableDuplicate?.task?.id,
+  "apply-extra",
+  "duplicate recovery may edit an existing task that contains an exact service/version blocker, even when unrelated services must be removed"
+);
+assert.deepStrictEqual(
+  editableDuplicate.matchedRequestedImages.map((item) => item.imageJenkinsName),
+  ["recure-emr-ewell-mastertest"],
+  "duplicate recovery records which selected service/version caused the blocker"
+);
+assert.deepStrictEqual(
+  editableDuplicate.targetImages.map((item) => item.imageJenkinsName),
+  ["recure-emr-ewell-mastertest", "recureweb-emr-ewell-mastertest"],
+  "duplicate recovery edits the task to the exact current pipeline service group"
+);
+assert.deepStrictEqual(
+  editableDuplicate.extraImages.map((item) => item.imageJenkinsName),
+  ["legacy-emr-ewell-mastertest"],
+  "duplicate recovery treats unrelated existing services as removable extras"
+);
+assert.strictEqual(
+  editableDuplicate.targetImages.some((item) => item.imageJenkinsName === "legacy-emr-ewell-mastertest"),
+  false,
+  "duplicate recovery must not carry unrelated existing services into the edited task"
+);
+assert.equal(
+  _internals.recoverableDuplicateBuildApplyGroup([
+    {
+      task: { id: "apply-building", pendingApply: true, applyStatus: "1" },
+      images: [recure]
+    }
+  ], [recure]),
+  null,
+  "duplicate recovery must not edit a task that has already started building"
+);
+assert.equal(
+  _internals.recoverableDuplicateBuildApplyGroup([
+    {
+      task: { id: "apply-old-version", pendingApply: true, applyStatus: "0" },
+      images: [{ ...recure, imageVersion: "v2.49.001" }]
+    }
+  ], [recure]),
+  null,
+  "duplicate recovery must match the exact duplicate service version, not just the service name"
 );
 
 console.log("platform client checks passed");

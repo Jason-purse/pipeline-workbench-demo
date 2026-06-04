@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 
 import {
+  blockedPhaseForPipelineError,
   canResumePipelineRun,
   clonePipelineRunRecord,
   clonePipelineRunDraft,
   DEFAULT_RELEASE_NOTICE,
   DEFAULT_RELEASE_REASON,
+  inferResumePoint,
   inferResumeStage,
+  mergePipelineRunHistories,
   normalizePipelineRunRecord,
   phaseCardsForRunRecord,
+  PIPELINE_RUN_HISTORY_LIMIT,
   progressForPhaseCards,
   releasePendingSummary,
   releaseStagesFor,
@@ -53,8 +57,53 @@ const baseRun = normalizePipelineRunRecord({
 assert.equal(baseRun.serviceSnapshot.length, 1);
 assert.equal(canResumePipelineRun(baseRun), true);
 assert.equal(inferResumeStage(baseRun), "release");
+assert.equal(inferResumePoint(baseRun).id, "release-observe", "release-observe blocked runs resume from release observation");
+const buildFailedRun = normalizePipelineRunRecord({
+  ...baseRun,
+  status: "failed",
+  phase: "失败",
+  outcomes: {
+    ...baseRun.outcomes,
+    build: { status: "failed", detail: "构建任务 apply-1 状态失败（build_apply_failed）" },
+    "build-observe": { status: "running", detail: "之前仍在观察构建" },
+    "release-observe": { status: "blocked", detail: "旧的发布观察痕迹" }
+  }
+});
+assert.equal(inferResumePoint(buildFailedRun).id, "build-observe", "build observation failure is the exact resume point");
+assert.equal(inferResumeStage(buildFailedRun), "build", "build failure must resume from build even when stale release evidence exists");
+assert.equal(buildFailedRun.resumeStage, "build", "stored resumeStage must be corrected to the real blocked build stage");
+assert.equal(buildFailedRun.phase, "构建失败", "stale release phase text must be corrected when build is the real failed stage");
+assert.equal(
+  buildFailedRun.outcomes["build-observe"].status,
+  "failed",
+  "normalization must reconcile old records where build failed but build-observe was still running"
+);
+assert.equal(blockedPhaseForPipelineError("build_apply_observe_timeout"), "等待构建完成");
+assert.equal(blockedPhaseForPipelineError("release_record_timeout"), "等待发布记录");
+assert.equal(blockedPhaseForPipelineError("unknown"), "等待处理");
+assert.equal(
+  inferResumePoint({ ...baseRun, outcomes: { ...baseRun.outcomes, "build-platform-publish": { status: "failed", detail: "company publish failed" } } }).id,
+  "build-platform-publish",
+  "build-platform publish failure resumes from that build substep"
+);
+assert.equal(
+  inferResumePoint({ ...baseRun, outcomes: { ...baseRun.outcomes, "release-detail": { status: "failed", detail: "detail failed" } } }).id,
+  "release-detail",
+  "release-detail failure resumes from release detail loading"
+);
+assert.equal(
+  inferResumePoint({ ...baseRun, target: { ...baseRun.target, branch: "master" }, outcomes: { ...baseRun.outcomes, "publish-company": { status: "failed", detail: "company failed" } } }).id,
+  "publish-company",
+  "company publish failure resumes from company publish"
+);
+assert.equal(
+  inferResumePoint({ ...baseRun, target: { ...baseRun.target, branch: "master" }, outcomes: { ...baseRun.outcomes, "publish-company": { status: "done" }, "publish-spot": { status: "blocked", detail: "spot blocked" } } }).id,
+  "publish-spot",
+  "spot publish failure resumes from spot publish without replaying company publish"
+);
 assert.equal(DEFAULT_RELEASE_REASON, "功能更新");
 assert.equal(DEFAULT_RELEASE_NOTICE, "测试");
+assert.equal(PIPELINE_RUN_HISTORY_LIMIT, 80, "run history should keep enough recent records while staying bounded");
 assert.equal(
   canResumePipelineRun({ ...baseRun, status: "running", outcomes: { "build-observe": { status: "running" } } }),
   false,
@@ -107,6 +156,14 @@ records = upsertPipelineRunRecord(records, { ...records[1], status: "done", upda
 assert.equal(records.length, 2);
 assert.equal(records[0].id, "run-2");
 assert.equal(records[0].status, "done");
+
+const mergedHistory = mergePipelineRunHistories(
+  [{ ...baseRun, id: "server-run", updatedAt: "2026-05-28T10:00:00.000Z" }],
+  [{ ...baseRun, id: "local-run", updatedAt: "2026-05-28T12:00:00.000Z" }],
+  [{ ...baseRun, id: "server-run", status: "done", updatedAt: "2026-05-28T13:00:00.000Z" }]
+);
+assert.deepEqual(mergedHistory.map((item) => item.id), ["server-run", "local-run"], "server and legacy local histories merge by id and newest update wins");
+assert.equal(mergedHistory[0].status, "done");
 
 assert.equal(canResumePipelineRun({ ...baseRun, status: "done", outcomes: { release: { status: "done" } } }), false);
 

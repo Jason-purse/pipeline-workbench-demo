@@ -1,10 +1,10 @@
-# Pipeline Workbench
+# Build & Release Workbench
 
-构建发布 Pipeline Workbench 是一个本地运行的 MVP：把“构建平台 + 发布平台”聚合成服务优先的 Pipeline 控制台。用户选择 workflow、应用、环境和服务后，通过常用 Pipeline 按钮完成构建、发布、重试和日志追踪。
+Build & Release Workbench 是一个本地运行的 MVP：把“构建平台 + 发布平台”聚合成服务优先的二合一构建发布控制台。用户选择 workflow、应用、环境和服务后，通过常用 Pipeline 按钮完成构建、发布、重试和日志追踪。
 
 ## 界面预览
 
-![Pipeline Workbench 首页](docs/assets/pipeline-workbench-home.jpg)
+![Build & Release Workbench 首页](docs/assets/pipeline-workbench-home.jpg)
 
 ## 能力范围
 

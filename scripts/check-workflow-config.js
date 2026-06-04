@@ -60,5 +60,15 @@ assert.match(
   /hiddenWorkflowProfileIds: Array\.from\(hiddenProfileIds\)/,
   "deleting a default workflow must persist the hidden workflow id locally"
 );
+assert.doesNotMatch(
+  serverSource,
+  /currentProfiles\.length\s*<=\s*1|workflow_delete_last_forbidden|至少保留一个 workflow/,
+  "workflow deletion must allow removing the last workflow so users can reset and re-add accounts"
+);
+assert.doesNotMatch(
+  fs.readFileSync(path.join(__dirname, "../src/client/src/App.jsx"), "utf8"),
+  /profiles\.length\s*<=\s*1/,
+  "settings UI must not disable deleting the last workflow"
+);
 
 console.log("workflow config checks passed");

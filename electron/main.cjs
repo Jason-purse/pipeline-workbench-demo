@@ -1,25 +1,95 @@
 const path = require("path");
+const { fork } = require("child_process");
 
 const { app, BrowserWindow, shell } = require("electron");
 
-let serverHandle = null;
+let serverProcess = null;
 let mainWindow = null;
+
+function readJsonFile(filePath) {
+  try {
+    return require("fs").existsSync(filePath)
+      ? JSON.parse(require("fs").readFileSync(filePath, "utf8"))
+      : null;
+  } catch (error) {
+    console.warn(`Failed to read Workbench platform config: ${error.message}`);
+    return null;
+  }
+}
+
+function setEnvIfPresent(key, value) {
+  if (process.env[key] == null && value) {
+    process.env[key] = String(value);
+  }
+}
+
+function applyBundledPlatformConfig(filePath) {
+  const config = readJsonFile(filePath);
+  if (!config || typeof config !== "object") return;
+  setEnvIfPresent("WORKBENCH_BUILD_HOST", config.build && config.build.host);
+  setEnvIfPresent("WORKBENCH_BUILD_API_BASE", config.build && config.build.apiBase);
+  setEnvIfPresent("WORKBENCH_BUILD_APP_ID", config.build && config.build.appId);
+  setEnvIfPresent("WORKBENCH_RELEASE_SHELL_HOST", config.releaseShell && config.releaseShell.host);
+  setEnvIfPresent("WORKBENCH_RELEASE_SHELL_API_BASE", config.releaseShell && config.releaseShell.apiBase);
+  setEnvIfPresent("WORKBENCH_RELEASE_API_HOST", config.releaseApi && config.releaseApi.host);
+  setEnvIfPresent("WORKBENCH_RELEASE_API_BASE", config.releaseApi && config.releaseApi.apiBase);
+}
 
 function configureWorkbenchRuntime() {
   const userDataDir = app.getPath("userData");
   process.env.WORKBENCH_ELECTRON = "1";
   process.env.WORKBENCH_SECRETS_PATH = process.env.WORKBENCH_SECRETS_PATH || path.join(userDataDir, ".workbench-secrets.json");
   process.env.WORKBENCH_CACHE_DIR = process.env.WORKBENCH_CACHE_DIR || path.join(userDataDir, "cache");
+  const bundledPlatformConfig = process.env.WORKBENCH_PLATFORM_CONFIG_PATH || path.join(process.resourcesPath, "platforms.json");
+  process.env.WORKBENCH_PLATFORM_CONFIG_PATH = bundledPlatformConfig;
+  applyBundledPlatformConfig(bundledPlatformConfig);
 }
 
 async function startWorkbenchServer() {
   configureWorkbenchRuntime();
-  const { startServer } = require("../src/server");
-  serverHandle = await startServer({
-    host: "127.0.0.1",
-    port: 0
+  const serverEntry = path.join(__dirname, "..", "src", "server.js");
+  serverProcess = fork(serverEntry, [], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: {
+      ...process.env,
+      WORKBENCH_ELECTRON_SERVER: "1",
+      HOST: "127.0.0.1",
+      PORT: "0"
+    }
   });
-  return serverHandle;
+
+  serverProcess.stdout.on("data", (chunk) => {
+    process.stdout.write(`[workbench-server] ${chunk}`);
+  });
+  serverProcess.stderr.on("data", (chunk) => {
+    process.stderr.write(`[workbench-server] ${chunk}`);
+  });
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Workbench server did not become ready in time."));
+    }, 15000);
+
+    serverProcess.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    serverProcess.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      if (!mainWindow) {
+        reject(new Error(`Workbench server exited before ready: code=${code || "-"} signal=${signal || "-"}`));
+      }
+    });
+    serverProcess.on("message", (message) => {
+      if (!message || message.type !== "workbench-server-ready") return;
+      clearTimeout(timeout);
+      resolve({
+        url: message.url,
+        port: message.port,
+        host: message.host
+      });
+    });
+  });
 }
 
 async function createMainWindow() {
@@ -29,7 +99,7 @@ async function createMainWindow() {
     height: 980,
     minWidth: 1100,
     minHeight: 720,
-    title: "Pipeline Workbench",
+    title: "Build & Release Workbench",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -67,9 +137,9 @@ app.on("activate", () => {
 });
 
 app.on("before-quit", () => {
-  if (serverHandle && serverHandle.server) {
-    serverHandle.server.close();
-    serverHandle = null;
+  if (serverProcess && !serverProcess.killed) {
+    serverProcess.kill();
+    serverProcess = null;
   }
 });
 

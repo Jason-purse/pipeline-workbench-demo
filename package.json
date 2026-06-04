@@ -1,8 +1,8 @@
 {
-  "name": "hospital-release-workbench-mvp",
+  "name": "build-release-workbench",
   "version": "0.1.0",
   "private": true,
-  "description": "Local MVP workbench for hospital build and release operations.",
+  "description": "Local MVP workbench for two-in-one hospital build and release operations.",
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node src/server.js",
@@ -10,11 +10,11 @@
     "electron": "npm run build && electron electron/main.cjs",
     "electron:check": "node scripts/check-electron-package.cjs",
     "electron:smoke": "npm run build && node scripts/run-electron-node-smoke.cjs",
-    "electron:pack": "npm run build && electron-builder --dir",
-    "electron:pack:win": "npm run build && electron-builder --win dir --x64",
+    "electron:pack": "npm run build && node scripts/prepare-electron-platform-config.cjs && electron-builder --dir",
+    "electron:pack:win": "npm run build && node scripts/prepare-electron-platform-config.cjs && electron-builder --win dir --x64",
     "prebuild": "node scripts/clean-vite-assets.cjs",
     "build": "vite build --config vite.config.js",
-    "check": "node --check src/server.js && node --check src/lib/crypto.js && node --check src/lib/platform-client.js && node --check src/data/profiles.js && node --check src/data/tasks.js && node --check electron/main.cjs && node --check scripts/check-electron-package.cjs && node --check scripts/electron-node-smoke.cjs && node --check scripts/run-electron-node-smoke.cjs && node --check scripts/clean-vite-assets.cjs && node --check src/client/src/lib/service-pagination.mjs && node --check src/client/src/lib/task-reuse.mjs && node --check src/client/src/lib/pipeline-observer.mjs && node --check src/client/src/lib/pipeline-run-store.mjs && node --check src/client/src/lib/workflow-environments.mjs && node --check public/pipeline-core.js && node --check public/pipeline-adapters.js && node --check public/run-store.js && node --check public/app.js && node scripts/check-pipeline-core.js && node scripts/check-task-reuse.js && node scripts/check-service-pagination.mjs && node scripts/check-client-task-reuse.mjs && node scripts/check-pipeline-observer.mjs && node scripts/check-pipeline-run-store.mjs && node scripts/check-workbench-ui-semantics.mjs && node scripts/check-platform-client.js && node scripts/check-workflow-config.js && node scripts/check-workflow-environments.mjs && npm run electron:check && npm run build"
+    "check": "node --check src/server.js && node --check src/lib/crypto.js && node --check src/lib/platform-client.js && node --check src/data/profiles.js && node --check src/data/tasks.js && node --check electron/main.cjs && node --check scripts/check-electron-package.cjs && node --check scripts/electron-node-smoke.cjs && node --check scripts/run-electron-node-smoke.cjs && node --check scripts/clean-vite-assets.cjs && node --check scripts/prepare-electron-platform-config.cjs && node --check scripts/check-pipeline-run-persistence.mjs && node --check src/client/src/lib/service-pagination.mjs && node --check src/client/src/lib/task-reuse.mjs && node --check src/client/src/lib/pipeline-observer.mjs && node --check src/client/src/lib/pipeline-run-store.mjs && node --check src/client/src/lib/workflow-environments.mjs && node --check public/pipeline-core.js && node --check public/pipeline-adapters.js && node --check public/run-store.js && node --check public/app.js && node scripts/check-pipeline-core.js && node scripts/check-task-reuse.js && node scripts/check-service-pagination.mjs && node scripts/check-client-task-reuse.mjs && node scripts/check-pipeline-observer.mjs && node scripts/check-pipeline-run-store.mjs && node scripts/check-pipeline-run-persistence.mjs && node scripts/check-workbench-ui-semantics.mjs && node scripts/check-platform-client.js && node scripts/check-workflow-config.js && node scripts/check-workflow-environments.mjs && npm run electron:check && npm run build"
   },
   "dependencies": {},
   "devDependencies": {
@@ -39,8 +39,8 @@
     "vite": "^4.5.3"
   },
   "build": {
-    "appId": "com.ewell.pipeline-workbench",
-    "productName": "Pipeline Workbench",
+    "appId": "com.ewell.build-release-workbench",
+    "productName": "Build & Release Workbench",
     "asar": true,
     "directories": {
       "output": "dist-electron"
@@ -58,6 +58,12 @@
       "!**/.workbench-secrets.json",
       "!**/.workbench-cache/**",
       "!**/.env"
+    ],
+    "extraResources": [
+      {
+        "from": "tmp/electron-platform-config/platforms.json",
+        "to": "platforms.json"
+      }
     ],
     "extraMetadata": {
       "main": "electron/main.cjs"

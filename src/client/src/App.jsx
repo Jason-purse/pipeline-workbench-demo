@@ -36,10 +36,12 @@ import {
   paginateRows,
   paginationItems,
   removeSelectedServiceKey,
-  serviceListPageInfo
+  serverPageInfo
 } from "@/lib/service-pagination.mjs";
 import {
   buildApplySignal,
+  buildPlatformPublishEnvironmentsFor,
+  buildPlatformPublishProgress,
   buildPlatformPublishSubmittedSignal,
   buildSignalForService,
   humanizeFailure,
@@ -59,9 +61,12 @@ import {
   clonePipelineRunDraft,
   DEFAULT_RELEASE_NOTICE,
   DEFAULT_RELEASE_REASON,
+  blockedPhaseForPipelineError,
   inferResumeStage,
+  mergePipelineRunHistories,
   normalizePipelineRunRecord,
   phaseCardsForRunRecord,
+  PIPELINE_RUN_HISTORY_LIMIT,
   progressForPhaseCards,
   releasePlanText,
   releaseRequired,
@@ -222,6 +227,18 @@ function workflowCustomerLabel(customer = {}) {
 function apiFetch(path, body) {
   return fetch(path, {
     method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  }).then((response) => response.json());
+}
+
+function apiGet(path) {
+  return fetch(path).then((response) => response.json());
+}
+
+function apiDelete(path, body = {}) {
+  return fetch(path, {
+    method: "DELETE",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   }).then((response) => response.json());
@@ -389,12 +406,12 @@ function App() {
     releaseReason: DEFAULT_RELEASE_REASON,
     releaseNotice: DEFAULT_RELEASE_NOTICE
   });
-  const [runHistory, setRunHistory] = useState(() =>
-    typeof window === "undefined" ? [] : restorePipelineRunHistory(window.localStorage)
-  );
+  const [runHistory, setRunHistory] = useState([]);
+  const [runHistoryLoaded, setRunHistoryLoaded] = useState(false);
   const [pendingRunAction, setPendingRunAction] = useState(null);
   const [expandedRunIds, setExpandedRunIds] = useState([]);
   const autoRefreshKeys = useRef(new Set());
+  const runHistorySaveTimer = useRef(null);
 
   useEffect(() => {
     fetch("/api/bootstrap")
@@ -402,6 +419,10 @@ function App() {
       .then((data) => {
         setBootstrap(data);
         setCredentialState(data.credentialState || []);
+        const localHistory = typeof window === "undefined" ? [] : restorePipelineRunHistory(window.localStorage);
+        const nextHistory = mergePipelineRunHistories(data.pipelineRunHistory || [], localHistory);
+        setRunHistory(nextHistory);
+        setRunHistoryLoaded(true);
         const profile = data.profiles?.find((item) => item.id === activeProfileId) || data.profiles?.[0];
         if (profile) {
           setActiveProfileId(profile.id);
@@ -410,7 +431,11 @@ function App() {
           setReleaseEnvId(profile.releaseEnvironments?.[0]?.id || "");
         }
       })
-      .catch((error) => setLastResult({ tone: "danger", title: "初始化失败", detail: error.message }));
+      .catch((error) => {
+        setRunHistory(typeof window === "undefined" ? [] : restorePipelineRunHistory(window.localStorage));
+        setRunHistoryLoaded(true);
+        setLastResult({ tone: "danger", title: "初始化失败", detail: error.message });
+      });
   }, []);
 
   const profiles = bootstrap?.profiles || [];
@@ -459,13 +484,13 @@ function App() {
   }, [profile?.id, appCode, branch, serviceSearch]);
 
   const servicePageData = useMemo(() => {
-    return serviceListPageInfo({
+    return serverPageInfo({
       rows: serviceRows,
-      search: serviceSearch,
-      page: servicePage,
+      total: branchDiscovery?.total ?? serviceRows.length,
+      pageNo: branchDiscovery?.pageNo ?? servicePage,
       pageSize: servicePageSize
     });
-  }, [serviceRows, serviceSearch, servicePage, servicePageSize]);
+  }, [branchDiscovery, serviceRows, servicePage, servicePageSize]);
 
   function serviceFromRow(row) {
     if (!profile || !row) return null;
@@ -492,6 +517,26 @@ function App() {
       .filter(Boolean);
   }, [selectedKeys, serviceRows, profile, appCode, branch, serviceMeta]);
 
+  useEffect(() => {
+    if (!bootstrap) return;
+    if (!profiles.length) {
+      if (activeProfileId) setActiveProfileId("");
+      if (activeAccountId) setActiveAccountId("");
+      return;
+    }
+    const nextProfile = profiles.find((item) => item.id === activeProfileId) || profiles[0];
+    const nextAccount = nextProfile.accounts?.find((item) => item.id === activeAccountId) || nextProfile.accounts?.[0];
+    if (nextProfile.id !== activeProfileId) setActiveProfileId(nextProfile.id);
+    if ((nextAccount?.id || "") !== activeAccountId) setActiveAccountId(nextAccount?.id || "");
+    if (!nextProfile.applications?.some((item) => item.code === appCode)) {
+      setAppCode(nextProfile.applications?.[0]?.code || "emr");
+      setSelectedKeys([]);
+    }
+    if (releaseRequired(branch) && !nextProfile.releaseEnvironments?.some((item) => item.id === releaseEnvId)) {
+      setReleaseEnvId(defaultReleaseEnvId(nextProfile, branch));
+    }
+  }, [bootstrap, profiles, activeProfileId, activeAccountId, appCode, branch, releaseEnvId]);
+
   const releaseApp = useMemo(() => {
     return pickReleaseApp(releaseProbe);
   }, [releaseProbe, env, appCode]);
@@ -501,8 +546,18 @@ function App() {
   const running = Boolean(busy);
 
   useEffect(() => {
+    if (!runHistoryLoaded) return undefined;
     if (typeof window !== "undefined") savePipelineRunHistory(window.localStorage, runHistory);
-  }, [runHistory]);
+    if (runHistorySaveTimer.current) clearTimeout(runHistorySaveTimer.current);
+    runHistorySaveTimer.current = setTimeout(() => {
+      apiFetch("/api/pipeline-runs", { runs: runHistory }).catch((error) => {
+        setLastResult({ tone: "warning", title: "Run 历史保存失败", detail: `已保留浏览器 fallback：${error.message}` });
+      });
+    }, 200);
+    return () => {
+      if (runHistorySaveTimer.current) clearTimeout(runHistorySaveTimer.current);
+    };
+  }, [runHistory, runHistoryLoaded]);
 
   useEffect(() => {
     if (!profile || !account || !appCode || !branch) return;
@@ -709,6 +764,27 @@ function App() {
     setLastResult({ tone: "success", title: "Pipeline 已复制", detail: `已新增 Run ${cloned.id}，可直接继续或查看配置。` });
   }
 
+  async function clearRunHistoryRecords() {
+    const preserved = run.id && run.status === "running"
+      ? runHistory.filter((record) => record.id === run.id)
+      : [];
+    setRunHistory(preserved);
+    setExpandedRunIds((current) => current.filter((id) => preserved.some((record) => record.id === id)));
+    try {
+      const json = preserved.length
+        ? await apiFetch("/api/pipeline-runs", { runs: preserved })
+        : await apiDelete("/api/pipeline-runs");
+      if (!json.ok) throw new Error(json.message || json.error || "Run 历史清空失败");
+      setLastResult({
+        tone: "success",
+        title: "Run 历史已清理",
+        detail: preserved.length ? "已清空历史，并保留当前运行中的 Pipeline Run。" : "Pipeline Run 历史已清空。"
+      });
+    } catch (error) {
+      setLastResult({ tone: "warning", title: "Run 历史清理失败", detail: error.message });
+    }
+  }
+
   function viewRunRecord(record) {
     setExpandedRunIds((current) => toggleExpandedRunIds(current, record.id));
   }
@@ -771,7 +847,9 @@ function App() {
         environmentFlag: overrides.environmentFlag || env?.environmentFlag,
         applicationVersion: overrides.applicationVersion,
         fast: overrides.fast !== false,
-        serviceSearch: overrides.serviceSearch ?? serviceSearch
+        serviceSearch: overrides.serviceSearch ?? serviceSearch,
+        servicePageNumber: overrides.servicePageNumber ?? servicePage,
+        servicePageSize: overrides.servicePageSize ?? servicePageSize
       };
       const json = await apiFetchWithRetry(`/api/probe/${kind}`, payload, {
         attempts: overrides.retryAttempts || 1,
@@ -820,7 +898,9 @@ function App() {
     setServicePageSize(nextPageSize);
     setServiceSearch(nextSearch);
     return refreshBoth({
-      serviceSearch: nextSearch
+      serviceSearch: nextSearch,
+      servicePageNumber: nextPage,
+      servicePageSize: nextPageSize
     });
   }
 
@@ -1086,6 +1166,7 @@ function buildImagesFor(services) {
       buildType: flow.structureType || "release",
       envName: branch,
       buildImages: buildImagesFor(services),
+      recoverDuplicateBuildInfo: true,
       confirmText: buildConfirmText("创建构建任务", services)
     });
     const result = json.result || json;
@@ -1135,6 +1216,22 @@ function buildImagesFor(services) {
         if (service.generatedVersion) patch[service.serviceKey] = { generatedVersion: service.generatedVersion };
       }
       mergeServiceMeta(patch);
+    }
+    if (result.recovered) {
+      const snapshot = taskSnapshotFor({
+        matchedTask: result.task || null,
+        taskImagesByTask: [{
+          task: result.task || null,
+          images: result.images || []
+        }]
+      }, updated, { preferMatchedTask: true });
+      updateOutcome("create-task", "done", "recovered duplicate apply");
+      addActivity(
+        "构建申请编辑恢复完成",
+        `已将已有申请 ${taskIdOf(result.task) || result.duplicateRecovery?.applyId || "-"} 编辑为当前服务组：${selectedServicesText(updated)}。`,
+        "success"
+      );
+      return { ok: true, services: updated, created: true, recovered: true, snapshot };
     }
     updateOutcome("create-task", "done", "created");
     addActivity("构建任务创建完成", result.reused ? "已复用已有任务。" : "构建平台已接受任务创建请求。", "success");
@@ -1397,7 +1494,6 @@ function buildImagesFor(services) {
     const buildTimeoutMs = options.buildTimeoutMs || PIPELINE_BUILD_OBSERVER_TIMEOUT_MS;
     const buildSnapshot = options.buildSnapshot || null;
     const confirmedBuildPublishes = new Set();
-    const confirmedBuildPublishTaskIds = new Set();
     const buildStartedAt = Date.now();
 
     for (let attempt = 1; ; attempt += 1) {
@@ -1460,14 +1556,44 @@ function buildImagesFor(services) {
         const message = `${failedText}，Pipeline 停在构建阶段，可修复后重试。`;
         addActivity("构建失败", message, "danger");
         updateOutcome("build", "failed", message);
+        updateOutcome("build-observe", "failed", message);
         return { ok: false, error: "build_failed", message };
       }
 
       const applyTaskId = applySignal?.taskId || taskIdOf(buildSnapshot?.task) || buildSnapshot?.task?.structureApplyId || "";
-      const publishKey = applySignal?.status === "publish_ready"
-        ? `${applySignal.taskId}:${applySignal.publishEnvironment}`
-        : "";
-      let decisionApplySignal = (publishKey && confirmedBuildPublishes.has(publishKey)) || (applyTaskId && confirmedBuildPublishTaskIds.has(applyTaskId))
+      const requiredBuildPublishEnvironments = buildPlatformPublishEnvironmentsFor(branch);
+      const confirmedEnvironments = requiredBuildPublishEnvironments.filter((environment) =>
+        confirmedBuildPublishes.has(`${applyTaskId}:${environment}`)
+      );
+      const publishProgress = buildPlatformPublishProgress({
+        branch,
+        applySignal,
+        confirmedEnvironments
+      });
+      if (publishProgress.status === "failed") {
+        const message = `构建任务 ${publishProgress.applySignal?.taskId || applyTaskId || "-"} 状态失败（${publishProgress.reason}），Pipeline 停在构建阶段，可修复后重试。`;
+        addActivity("构建失败", message, "danger");
+        updateOutcome("build", "failed", message);
+        updateOutcome("build-observe", "failed", message);
+        return { ok: false, error: "build_failed", message };
+      }
+      if (publishProgress.status === "confirm") {
+        const confirmed = await confirmBuildPlatformPublishFor({
+          ...(applySignal || {}),
+          taskId: applyTaskId || applySignal?.taskId,
+          publishEnvironment: publishProgress.environment
+        }, services);
+        if (!confirmed.ok) return confirmed;
+        confirmedBuildPublishes.add(`${applyTaskId || applySignal?.taskId}:${publishProgress.environment}`);
+        updateOutcome("build-platform-publish", "running", `${buildPlatformPublishEnvironmentsFor(branch).length - publishProgress.missingEnvironments.length + 1}/${buildPlatformPublishEnvironmentsFor(branch).length}`);
+        await sleep(1000);
+        continue;
+      }
+      if (requiredBuildPublishEnvironments.length && publishProgress.status === "complete") {
+        const label = requiredBuildPublishEnvironments.map(buildPublishEnvironmentLabel).join(" + ");
+        updateOutcome("build-platform-publish", "done", label);
+      }
+      const decisionApplySignal = requiredBuildPublishEnvironments.length && publishProgress.status === "complete"
         ? buildPlatformPublishSubmittedSignal(applySignal || {}, applyTaskId)
         : applySignal;
       const decision = pipelineObservationDecision({
@@ -1478,14 +1604,6 @@ function buildImagesFor(services) {
         elapsedMs: buildElapsedMs,
         timeoutMs: buildTimeoutMs
       });
-
-      if (decision.status === "confirm_build_publish") {
-        const confirmed = await confirmBuildPlatformPublishFor(decision.applySignal, services);
-        if (!confirmed.ok) return confirmed;
-        confirmedBuildPublishes.add(publishKey);
-        if (decision.applySignal?.taskId) confirmedBuildPublishTaskIds.add(decision.applySignal.taskId);
-        decisionApplySignal = buildPlatformPublishSubmittedSignal(decision.applySignal, decision.applySignal?.taskId);
-      }
 
       if (decision.status === "running" && decision.reason !== "release_record_waiting") {
         const waiting = buildSignals
@@ -1647,8 +1765,6 @@ function buildImagesFor(services) {
     const release = observed?.release || await runProbe("release", { silentBusy: true, fast: false });
     if (!release?.ok) return { ok: false, error: "release_probe_failed", message: summarizeFailure(release) };
     const app = observed?.app || pickReleaseApp(release);
-    const detail = await probeReleaseDetailFor(app);
-    if (!detail.ok) return detail;
     if (!releaseStages.includes("company")) {
       addActivity("公司发布跳过", `${branch} 环境策略为 ${releasePlanText(branch)}。`, "success");
       updateOutcome("publish-company", "done", "skipped by policy");
@@ -1656,9 +1772,19 @@ function buildImagesFor(services) {
     releaseStages.forEach((stage) => {
       updateOutcome(`publish-${stage}`, "running", `${releaseStageLabel(stage)} pending`);
     });
-    const publishedResults = await Promise.all(releaseStages.map((stage) => publishFor(stage, app, detail.result)));
-    const failed = publishedResults.find((result) => !result.ok);
-    if (failed) return failed;
+    let currentRelease = release;
+    let currentApp = app;
+    for (const stage of releaseStages) {
+      if (stage !== releaseStages[0]) {
+        currentRelease = await runProbe("release", { silentBusy: true, fast: false });
+        if (!currentRelease?.ok) return { ok: false, error: "release_probe_failed", message: summarizeFailure(currentRelease) };
+        currentApp = pickReleaseApp(currentRelease) || currentApp;
+      }
+      const detail = await probeReleaseDetailFor(currentApp);
+      if (!detail.ok) return detail;
+      const published = await publishFor(stage, currentApp, detail.result);
+      if (!published.ok) return published;
+    }
     updateOutcome("release", "done", `${releasePlanText(branch)} published`);
     return { ok: true, stages: releaseStages };
   }
@@ -1806,7 +1932,7 @@ function buildImagesFor(services) {
         });
         if (!release.ok) {
           if (release.blocked) {
-            setRunPhase("等待发布记录", "blocked");
+            setRunPhase(blockedPhaseForPipelineError(release.error), "blocked");
             setLastResult({ tone: "warning", title: "Pipeline 已暂停", detail: release.message });
             return;
           }
@@ -1919,7 +2045,7 @@ function buildImagesFor(services) {
 
       if (result && !result.ok) {
         if (result.blocked) {
-          setRunPhase(result.error === "release_record_timeout" ? "等待发布记录" : "等待处理", "blocked");
+          setRunPhase(blockedPhaseForPipelineError(result.error), "blocked");
           setLastResult({ tone: "warning", title: "Pipeline 已暂停", detail: result.message });
           return;
         }
@@ -1967,7 +2093,7 @@ function buildImagesFor(services) {
   const releasePlan = releasePlanText(branch);
   const selectorGridClass = "[grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr))]";
   const selectorTriggerClass = "h-12 w-full justify-between truncate text-left text-base [&>span]:truncate";
-  if (!bootstrap || !profile) {
+  if (!bootstrap) {
     return (
       <main className="grid min-h-screen place-items-center bg-background">
         <div className="flex items-center gap-3 text-muted-foreground">
@@ -1978,6 +2104,8 @@ function buildImagesFor(services) {
     );
   }
 
+  const workbenchUnavailable = !profile || !account;
+
   return (
     <main className="ops-shell min-h-screen">
       <div className="mx-auto flex min-h-screen w-full max-w-[1760px] flex-col gap-4 px-4 py-4 lg:px-6">
@@ -1985,7 +2113,7 @@ function buildImagesFor(services) {
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid h-11 w-11 shrink-0 place-items-center rounded-lg bg-primary font-display text-sm font-bold text-primary-foreground">WB</div>
             <div className="min-w-0">
-              <h1 className="font-display text-xl font-semibold tracking-normal">构建发布 Pipeline Workbench</h1>
+              <h1 className="font-display text-xl font-semibold tracking-normal">Build & Release Workbench</h1>
               <p className="text-sm text-muted-foreground">选择服务或服务组，点击常用 Pipeline，系统负责串起两个平台。</p>
             </div>
           </div>
@@ -2005,21 +2133,25 @@ function buildImagesFor(services) {
           </TabsList>
 
           <TabsContent value="workbench" className="space-y-4">
-            <EnvironmentBand
-              profile={profile}
-              appCode={appCode}
-              branch={branch}
-              env={env}
-              releaseNeeded={releaseNeeded}
-              releaseApp={releaseApp}
-              buildProbe={buildProbe}
-              releaseProbe={releaseProbe}
-              releasePlan={releasePlan}
-              selectedLabel={selectedLabel}
-              lastResult={lastResult}
-            />
+            {workbenchUnavailable ? (
+              <EmptyWorkflowState onSettings={() => setActiveTab("settings")} />
+            ) : (
+              <>
+                <EnvironmentBand
+                  profile={profile}
+                  appCode={appCode}
+                  branch={branch}
+                  env={env}
+                  releaseNeeded={releaseNeeded}
+                  releaseApp={releaseApp}
+                  buildProbe={buildProbe}
+                  releaseProbe={releaseProbe}
+                  releasePlan={releasePlan}
+                  selectedLabel={selectedLabel}
+                  lastResult={lastResult}
+                />
 
-            <section className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_380px]">
+                <section className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <Card className="min-w-0">
                 <CardHeader className="pb-3">
                   <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -2186,16 +2318,20 @@ function buildImagesFor(services) {
               </Card>
               </div>
 		            </section>
+              </>
+            )}
 
-		            <PipelineRunTable
-		              runs={runHistory}
-		              currentRunId={run.id}
-		              running={running}
-		              expandedRunIds={expandedRunIds}
-		              onView={viewRunRecord}
-		              onCopy={copyRunRecord}
-	              onResume={(record) => loadRunDraft(record, { action: "resume" })}
-	            />
+            <PipelineRunTable
+              runs={runHistory}
+              historyLimit={bootstrap?.pipelineRunHistoryLimit || PIPELINE_RUN_HISTORY_LIMIT}
+              currentRunId={run.id}
+              running={running}
+              expandedRunIds={expandedRunIds}
+              onView={viewRunRecord}
+              onCopy={copyRunRecord}
+              onClearHistory={clearRunHistoryRecords}
+              onResume={(record) => loadRunDraft(record, { action: "resume" })}
+            />
 
           </TabsContent>
 
@@ -2337,6 +2473,23 @@ function WorkflowSwitcher({ workflowItems, activeWorkflowId, onSelect, onSetting
   );
 }
 
+function EmptyWorkflowState({ onSettings }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>还没有 workflow</CardTitle>
+        <CardDescription>先到系统配置里输入账号和密码，探测构建平台客户后初始化 workflow。</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Button onClick={onSettings}>
+          <Plus className="mr-2 h-4 w-4" />
+          新增 workflow
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 function BandItem({ label, value }) {
   return (
     <div className="min-w-0">
@@ -2392,7 +2545,7 @@ function formatRunTime(value) {
   return date.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-function PipelineRunTable({ runs, currentRunId, running, expandedRunIds = [], onView, onCopy, onResume }) {
+function PipelineRunTable({ runs, historyLimit = PIPELINE_RUN_HISTORY_LIMIT, currentRunId, running, expandedRunIds = [], onView, onCopy, onClearHistory, onResume }) {
   const [runPage, setRunPage] = useState(1);
   const [runPageSize, setRunPageSize] = useState(DEFAULT_RUN_PAGE_SIZE);
   const pageData = useMemo(() => paginateRows(runs, runPage, runPageSize), [runs, runPage, runPageSize]);
@@ -2411,9 +2564,15 @@ function PipelineRunTable({ runs, currentRunId, running, expandedRunIds = [], on
                 <History className="h-5 w-5 text-primary" />
                 Pipeline Run 表
               </CardTitle>
-              <CardDescription>保存最近 Run，可查看、复制配置生成新 Run，或从暂停/失败/待启动阶段继续。</CardDescription>
+              <CardDescription>服务端持久保存最近 {historyLimit} 条 Run，可查看、复制配置生成新 Run，或从暂停/失败/待启动阶段继续。</CardDescription>
             </div>
-            <Badge variant="outline">{runs.length} 条</Badge>
+            <div className="flex flex-wrap items-center gap-2 md:justify-end">
+              <Badge variant="outline">{runs.length} 条</Badge>
+              <Button variant="outline" size="sm" onClick={onClearHistory} disabled={!runs.length}>
+                <Trash2 className="mr-1 h-3.5 w-3.5" />
+                清空历史
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
@@ -3023,7 +3182,7 @@ function SettingsPanel({ profiles, credentialState, onSaved, onGo }) {
                     variant="destructive"
                     size="sm"
                     onClick={() => deleteWorkflow(profile)}
-                    disabled={workflowDeleting === profile.id || profiles.length <= 1}
+                    disabled={workflowDeleting === profile.id}
                   >
                     <Trash2 className="mr-2 h-4 w-4" />
                     {workflowDeleting === profile.id ? "删除中" : workflowDeleteConfirm === profile.id ? "确认删除" : "删除"}

@@ -18,7 +18,8 @@ const RELEASE_HTTP_CONNECT_TIMEOUT_SECONDS = Number(process.env.WORKBENCH_RELEAS
 const RELEASE_HTTP_MAX_TIME_SECONDS = Number(process.env.WORKBENCH_RELEASE_HTTP_MAX_TIME_SECONDS || 35);
 const PUBLISH_RATE_INTERVAL_MS = Number(process.env.WORKBENCH_PUBLISH_RATE_INTERVAL_MS || 5000);
 const PUBLISH_RATE_MAX_ATTEMPTS = Number(process.env.WORKBENCH_PUBLISH_RATE_MAX_ATTEMPTS || 24);
-const SERVICE_PAGE_SIZE = Number(process.env.WORKBENCH_SERVICE_PAGE_SIZE || 100);
+const SERVICE_PAGE_SIZE = Number(process.env.WORKBENCH_SERVICE_PAGE_SIZE || 10);
+const SERVICE_MAX_PAGE_SIZE = Number(process.env.WORKBENCH_SERVICE_MAX_PAGE_SIZE || 100);
 const SERVICE_MAX_PAGES = Number(process.env.WORKBENCH_SERVICE_MAX_PAGES || 3);
 const sessionCache = new Map();
 const retainedCookieJars = new Set();
@@ -508,6 +509,43 @@ function findBuildImage(imageRows, options = {}) {
   );
 }
 
+function isEditableDuplicateApplyTask(task) {
+  if (!task || !task.pendingApply) return false;
+  return ["0", "4"].includes(String(task.applyStatus ?? ""));
+}
+
+function recoverableDuplicateBuildApplyGroup(groups, requestedImages = []) {
+  const targetImages = requestedImagesForTaskLookup(requestedImages, false)
+    .filter((item) => (item.imageJenkinsName || item.imageNameEn) && item.imageVersion);
+  if (!targetImages.length) return null;
+
+  for (const group of arrayOf(groups)) {
+    const task = group && group.task;
+    if (!isEditableDuplicateApplyTask(task)) continue;
+    const images = arrayOf(group && group.images);
+    const matchedRequestedImages = targetImages.filter((image) =>
+      images.some((item) => imageMatchesRequest(item, image))
+    );
+    if (!matchedRequestedImages.length) continue;
+    const extraImages = images.filter((item) =>
+      !targetImages.some((image) => imageMatchesRequestIdentity(item, image))
+    );
+    const missingTargetImages = targetImages.filter((image) =>
+      !images.some((item) => imageMatchesRequestIdentity(item, image))
+    );
+    return {
+      ...group,
+      task,
+      images: images.map(compactObject),
+      targetImages: targetImages.map(compactObject),
+      matchedRequestedImages: matchedRequestedImages.map(compactObject),
+      extraImages: extraImages.map(compactObject),
+      missingTargetImages: missingTargetImages.map(compactObject)
+    };
+  }
+  return null;
+}
+
 function pendingApplyRowMatches(row, options = {}, requestedImages = []) {
   if (!row || typeof row !== "object") return false;
   const branch = options.envType || options.codeBranch;
@@ -605,10 +643,24 @@ function buildApplyRowMatches(row, options = {}, requestedImages = []) {
   return true;
 }
 
+function duplicateApplyRowMatches(row, options = {}) {
+  if (!row || typeof row !== "object") return false;
+  const branch = options.envType || options.codeBranch;
+  if (options.customerNameEn && row.customerNameEn !== options.customerNameEn) return false;
+  if (options.applicationCode && row.applicationCode && row.applicationCode !== options.applicationCode) return false;
+  if (branch && row.branch && row.branch !== branch) return false;
+  return true;
+}
+
 function buildApplyStatusCandidates(options = {}) {
   if (options.status !== undefined && options.status !== null && options.status !== "") return [String(options.status)];
   const applyId = options.applyId || options.taskId || options.structureApplyId;
   return applyId ? ["0", "2", "1"] : ["0"];
+}
+
+function duplicateBuildApplyStatusCandidates(options = {}) {
+  if (options.status !== undefined && options.status !== null && options.status !== "") return [String(options.status)];
+  return arrayOf(options.statusCandidates).length ? arrayOf(options.statusCandidates).map(String) : ["0", "1"];
 }
 
 function listBuildApplyGroups(session, options = {}, requestedImages = []) {
@@ -691,6 +743,101 @@ function listBuildApplyGroups(session, options = {}, requestedImages = []) {
       images: rawImages.map(compactObject),
       pendingApply: true
     });
+  }
+
+  return {
+    groups,
+    rowsChecked,
+    total: aggregateTotal,
+    totalPages: aggregateTotalPages,
+    pagesFetched: aggregatePagesFetched,
+    hasMore: aggregateHasMore,
+    statusCandidates,
+    pageSummaries,
+    response: responseSummary(firstResponse)
+  };
+}
+
+function listDuplicateBuildApplyGroups(session, options = {}, requestedImages = []) {
+  const targetImages = requestedImagesForTaskLookup(requestedImages, false)
+    .filter((item) => (item.imageJenkinsName || item.imageNameEn) && item.imageVersion);
+  if (!targetImages.length || !options.customerNameEn || !options.applicationCode || !(options.codeBranch || options.envType)) {
+    return {
+      groups: [],
+      rowsChecked: 0,
+      response: null
+    };
+  }
+
+  const pageSize = Number(options.pendingApplyPageSize || options.applyPageSize || 20);
+  const basePayload = {
+    userId: session.login.staffCode,
+    customerNameEn: options.customerNameEn,
+    applicationCode: options.applicationCode,
+    pageSize
+  };
+  Object.keys(basePayload).forEach((key) => {
+    if (basePayload[key] == null || basePayload[key] === "") delete basePayload[key];
+  });
+
+  const statusCandidates = duplicateBuildApplyStatusCandidates(options);
+  const rows = [];
+  const pageSummaries = [];
+  let firstResponse = null;
+  let rowsChecked = 0;
+  let aggregateTotal = 0;
+  let aggregatePagesFetched = 0;
+  let aggregateHasMore = false;
+  let aggregateTotalPages = 0;
+
+  for (const status of statusCandidates) {
+    const firstPageResponse = postJsonViaNode(
+      `${platforms.build.apiBase}/support/structureListPage`,
+      createWrapper({ ...basePayload, status, pageNumber: 1 }),
+      session.cookieJar
+    );
+    if (!firstResponse) firstResponse = firstPageResponse;
+    const firstObject = objectOf(firstPageResponse);
+    const total = Number(firstObject && firstObject.total) || arrayOf(firstObject).length;
+    const { pagesToFetch, hasMore, totalPages } = boundedPageCount(total, pageSize, options.maxPendingApplyPages || options.maxApplyPages || 5);
+    const statusRows = [...arrayOf(firstObject)];
+
+    for (let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber += 1) {
+      const pageResponse = postJsonViaNode(
+        `${platforms.build.apiBase}/support/structureListPage`,
+        createWrapper({ ...basePayload, status, pageNumber }),
+        session.cookieJar
+      );
+      statusRows.push(...arrayOf(objectOf(pageResponse)));
+    }
+
+    rowsChecked += statusRows.length;
+    aggregateTotal += total;
+    aggregatePagesFetched += pagesToFetch;
+    aggregateHasMore = aggregateHasMore || hasMore;
+    aggregateTotalPages += totalPages;
+    pageSummaries.push({ status, rows: statusRows.length, total, pagesFetched: pagesToFetch, hasMore });
+    rows.push(...statusRows.map((row) => ({ ...row, structureListStatus: status })));
+  }
+
+  const groups = [];
+  for (const row of rows) {
+    if (!duplicateApplyRowMatches(row, options)) continue;
+    const rowApplyId = row.id;
+    if (!rowApplyId) continue;
+    const serviceResponse = postJsonViaNode(
+      `${platforms.build.apiBase}/support/serviceList`,
+      createWrapper({ applyId: rowApplyId, staffCode: session.login.staffCode }),
+      session.cookieJar
+    );
+    const rawImages = arrayOf(objectOf(serviceResponse));
+    const candidate = recoverableDuplicateBuildApplyGroup([{
+      taskId: rowApplyId,
+      task: compactPendingBuildApply(row),
+      images: rawImages.map(compactObject),
+      pendingApply: true
+    }], targetImages);
+    if (candidate) groups.push(candidate);
   }
 
   return {
@@ -1164,6 +1311,20 @@ function normalizeServiceQuery(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizeServiceSearchPayload(value) {
+  return String(value || "").trim();
+}
+
+function normalizePositiveInteger(value, fallback, max) {
+  const numeric = Number(value);
+  const normalizedFallback = Math.max(1, Math.trunc(Number(fallback) || 1));
+  if (!Number.isFinite(numeric)) return normalizedFallback;
+  const integer = Math.trunc(numeric);
+  if (integer < 1) return normalizedFallback;
+  const normalizedMax = max ? Math.max(1, Math.trunc(Number(max) || integer)) : null;
+  return normalizedMax ? Math.min(integer, normalizedMax) : integer;
+}
+
 function serviceRowMatchesQuery(row, query) {
   const normalizedQuery = normalizeServiceQuery(query);
   if (!normalizedQuery) return true;
@@ -1177,42 +1338,34 @@ function serviceRowMatchesQuery(row, query) {
   ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery));
 }
 
-function fetchPublishMicroServices(session, payload) {
-  const firstPayload = {
+function fetchPublishMicroServices(session, payload, options = {}) {
+  const pageNumber = normalizePositiveInteger(options.pageNumber ?? payload.pageNumber, 1);
+  const pageSize = normalizePositiveInteger(options.pageSize ?? payload.pageSize, SERVICE_PAGE_SIZE, SERVICE_MAX_PAGE_SIZE);
+  const serviceSearch = normalizeServiceSearchPayload(options.serviceSearch ?? payload.imageJenkinsName);
+  const requestPayload = compactObject({
     ...payload,
-    pageNumber: 1,
-    pageSize: SERVICE_PAGE_SIZE
-  };
+    imageJenkinsName: serviceSearch || undefined,
+    pageNumber,
+    pageSize
+  });
   const response = postJsonViaNode(
     `${platforms.build.apiBase}/support/selectPublishMicroServiceInfo`,
-    createWrapper(firstPayload),
+    createWrapper(requestPayload),
     session.cookieJar
   );
   const responseObject = objectOf(response);
   const rows = arrayOf(responseObject);
   const total = Number(responseObject && responseObject.total) || rows.length;
-  const { totalPages, pagesToFetch, hasMore } = boundedPageCount(total, SERVICE_PAGE_SIZE, SERVICE_MAX_PAGES);
-
-  for (let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber += 1) {
-    const pageResponse = postJsonViaNode(
-      `${platforms.build.apiBase}/support/selectPublishMicroServiceInfo`,
-      createWrapper({
-        ...payload,
-        pageNumber,
-        pageSize: SERVICE_PAGE_SIZE
-      }),
-      session.cookieJar
-    );
-    rows.push(...arrayOf(objectOf(pageResponse)));
-  }
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return {
     total,
-    pageNo: 1,
-    pageSize: SERVICE_PAGE_SIZE,
+    pageNo: pageNumber,
+    pageSize,
     totalPages,
-    pagesFetched: pagesToFetch,
-    hasMore,
+    pagesFetched: 1,
+    hasMore: pageNumber < totalPages,
+    query: serviceSearch,
     rows,
     status: response.json && response.json.status,
     error: response.json && response.json.error,
@@ -1449,6 +1602,8 @@ function discoverApplicationServices(session, options) {
   const applicationCodes = options.applicationCodes && options.applicationCodes.length ? options.applicationCodes : ["emr", "mem"];
   const targetBranch = options.codeBranch;
   const serviceSearch = options.serviceSearch || "";
+  const servicePageNumber = options.servicePageNumber || 1;
+  const servicePageSize = options.servicePageSize || SERVICE_PAGE_SIZE;
 
   return applicationCodes.map((applicationCode) => {
     try {
@@ -1481,23 +1636,24 @@ function discoverApplicationServices(session, options) {
           customerNameEn,
           applicationCode,
           codeBranch
+        }, {
+          pageNumber: servicePageNumber,
+          pageSize: servicePageSize,
+          serviceSearch
         });
-        const allRows = serviceObject.rows.map((row) => normalizeServiceRow(row, { customerNameEn, applicationCode, codeBranch }));
-        const rows = serviceSearch
-          ? allRows.filter((row) => serviceRowMatchesQuery(row, serviceSearch))
-          : allRows;
+        const rows = serviceObject.rows.map((row) => normalizeServiceRow(row, { customerNameEn, applicationCode, codeBranch }));
         return {
           codeBranch,
-          total: rows.length,
+          total: serviceObject.total,
           rawTotal: serviceObject.total,
-          pageNo: 1,
-          pageSize: rows.length,
+          pageNo: serviceObject.pageNo,
+          pageSize: serviceObject.pageSize,
           totalPages: serviceObject.totalPages,
           pagesFetched: serviceObject.pagesFetched,
           hasMore: serviceObject.hasMore,
           serverPaged: serviceObject.serverPaged,
-          query: normalizeServiceQuery(serviceSearch),
-          unfilteredRows: allRows.length,
+          query: serviceObject.query,
+          visibleRows: rows.length,
           rows,
           status: serviceObject.status,
           error: serviceObject.error
@@ -1652,6 +1808,65 @@ function probeBuildServiceDetail(credentials, options = {}) {
   }
 }
 
+function probeBuildLog(credentials, options = {}) {
+  const session = loginBuildPlatform(credentials);
+  if (!session.ok) return { ok: false, session };
+
+  const payload = {
+    customerNameEn: options.customerNameEn,
+    codeBranch: options.codeBranch,
+    applicationName: options.applicationCode,
+    imageJenkinsName: options.imageJenkinsName,
+    buildID: String(options.buildID || options.buildId || "").replace(/^#/, "")
+  };
+
+  if (!payload.customerNameEn || !payload.codeBranch || !payload.applicationName || !payload.imageJenkinsName || !payload.buildID) {
+    removeCookieJar(session.cookieJar);
+    return {
+      ok: false,
+      session: session.login,
+      reason: "missing_build_log_params"
+    };
+  }
+
+  try {
+    const log = postJsonViaNode(
+      `${platforms.build.apiBase}/support/getStructureLog`,
+      createWrapper(payload),
+      session.cookieJar,
+      { maxTimeSeconds: Math.max(HTTP_MAX_TIME_SECONDS, 30) }
+    );
+    const object = objectOf(log);
+    return {
+      ok: true,
+      session: session.login,
+      service: {
+        applicationCode: options.applicationCode,
+        codeBranch: options.codeBranch,
+        imageJenkinsName: options.imageJenkinsName,
+        buildID: payload.buildID
+      },
+      payload,
+      log: typeof object === "string" ? object : object,
+      response: responseSummary(log)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      session: session.login,
+      service: {
+        applicationCode: options.applicationCode,
+        codeBranch: options.codeBranch,
+        imageJenkinsName: options.imageJenkinsName,
+        buildID: payload.buildID
+      },
+      ...classifyRequestError(error, { maxTimeSeconds: Math.max(HTTP_MAX_TIME_SECONDS, 30) })
+    };
+  } finally {
+    removeCookieJar(session.cookieJar);
+  }
+}
+
 function executeBuildImages(credentials, options = {}) {
   const session = loginBuildPlatform(credentials);
   if (!session.ok) return { ok: false, session };
@@ -1727,6 +1942,164 @@ function executeBuildImages(credentials, options = {}) {
   } finally {
     removeCookieJar(session.cookieJar);
   }
+}
+
+function buildRecoveryEditImages(requestedImages) {
+  return requestedImagesForTaskLookup(requestedImages, false)
+    .map((item) => ({
+      imageJenkinsName: item.imageJenkinsName,
+      imageVersion: item.imageVersion,
+      imageDeployId: item.imageDeployId,
+      imageNameEn: item.imageNameEn,
+      applicationCode: item.applicationCode
+    }))
+    .filter((item) => item.imageJenkinsName);
+}
+
+function recoverDuplicateBuildApplyInSession(session, options = {}, requestedImages = []) {
+  const targetImages = buildRecoveryEditImages(requestedImages);
+  const missingImageVersions = targetImages.filter((item) => !item.imageVersion);
+  const missingDeployIds = targetImages.filter((item) => item.imageDeployId == null || item.imageDeployId === "");
+  if (!targetImages.length || missingImageVersions.length || missingDeployIds.length) {
+    return {
+      ok: false,
+      reason: "missing_duplicate_recovery_target_identity",
+      message: "已有构建信息恢复需要当前服务组的 imageJenkinsName、imageVersion 和 imageDeployId。",
+      targetImages: targetImages.map(compactObject),
+      missingImageVersions: missingImageVersions.map(compactObject),
+      missingDeployIds: missingDeployIds.map(compactObject)
+    };
+  }
+
+  const applyProbe = listDuplicateBuildApplyGroups(session, options, targetImages);
+  const candidate = applyProbe.groups[0] || null;
+  if (!candidate) {
+    return {
+      ok: false,
+      reason: "recoverable_duplicate_apply_not_found",
+      message: "平台提示已有构建信息，但未定位到可编辑的同版本阻塞申请。",
+      targetImages: targetImages.map(compactObject),
+      applyProbe: {
+        groups: applyProbe.groups.length,
+        rowsChecked: applyProbe.rowsChecked,
+        pagesFetched: applyProbe.pagesFetched,
+        hasMore: applyProbe.hasMore,
+        statusCandidates: applyProbe.statusCandidates,
+        pageSummaries: applyProbe.pageSummaries
+      }
+    };
+  }
+
+  const applyId = firstPrimitive(candidate.task, ["structureApplyId", "applyId", "id", "taskId"]);
+  if (!applyId) {
+    return {
+      ok: false,
+      reason: "missing_recoverable_apply_id",
+      message: "已定位到同版本阻塞申请，但缺少 applyId，无法编辑。",
+      candidate
+    };
+  }
+
+  let returnOutcome = null;
+  if (String(candidate.task.applyStatus ?? "") !== "4") {
+    const returnResponse = postJsonViaNode(
+      `${platforms.build.apiBase}/support/updateProdStructApplyStatus`,
+      createWrapper({
+        userId: session.login.staffCode,
+        applyId,
+        applyStatus: "4"
+      }),
+      session.cookieJar
+    );
+    returnOutcome = looseMutationOutcome(returnResponse);
+    if (!returnOutcome.businessOk) {
+      return {
+        ok: false,
+        reason: "return_apply_business_failed",
+        message: businessFailureMessage("构建申请退回", returnOutcome),
+        applyId,
+        candidate,
+        response: returnOutcome
+      };
+    }
+  }
+
+  const editImages = targetImages.map((item) => ({
+    imageJenkinsName: item.imageJenkinsName,
+    imageVersion: item.imageVersion,
+    imageDeployId: item.imageDeployId
+  }));
+  const editPayload = {
+    applyId,
+    customerNameEn: options.customerNameEn,
+    applicationCode: options.applicationCode,
+    applyBy: session.login.staffCode,
+    userNameAuth: session.login.userNameCn,
+    branch: options.codeBranch || options.branch || options.envType,
+    structureType: options.structureType || candidate.task.structureType || "prod",
+    deploymentDescribe: options.deploymentDescribe,
+    deploymentExplain: options.deploymentExplain,
+    envName: options.envName || options.codeBranch || options.envType,
+    isFeiShu: "0",
+    images: editImages
+  };
+  if (options.canaryNamespaceId) editPayload.canaryNamespaceId = options.canaryNamespaceId;
+
+  const editResponse = postJsonViaNode(
+    `${platforms.build.apiBase}/support/applyProdStruct`,
+    createWrapper(editPayload),
+    session.cookieJar
+  );
+  const editOutcome = mutationOutcome(editResponse);
+  if (!editOutcome.businessOk) {
+    return {
+      ok: false,
+      reason: "edit_apply_business_failed",
+      message: businessFailureMessage("构建申请编辑保存", editOutcome),
+      applyId,
+      candidate,
+      returnResponse: returnOutcome,
+      payload: editPayload,
+      response: editOutcome
+    };
+  }
+
+  let verify = null;
+  try {
+    verify = listBuildApplyGroups(session, {
+      ...options,
+      applyId,
+      status: "0",
+      maxApplyPages: 1,
+      maxPendingApplyPages: 1
+    }, targetImages);
+  } catch (error) {
+    verify = {
+      error: error.message,
+      groups: []
+    };
+  }
+  const verifiedGroup = verify.groups?.[0] || null;
+  return {
+    ok: true,
+    recovered: true,
+    strategy: "return-edit-existing-apply",
+    applyId,
+    candidate,
+    targetImages: targetImages.map(compactObject),
+    returnResponse: returnOutcome,
+    payload: editPayload,
+    response: editOutcome,
+    task: verifiedGroup?.task || { ...candidate.task, id: applyId, taskId: applyId, structureApplyId: applyId, applyStatus: "0" },
+    images: verifiedGroup?.images || targetImages.map(compactObject),
+    verify: verify ? {
+      groups: verify.groups?.length || 0,
+      rowsChecked: verify.rowsChecked,
+      pagesFetched: verify.pagesFetched,
+      hasMore: verify.hasMore,
+      error: verify.error
+    } : null
+  };
 }
 
 function executeBuildTask(credentials, options = {}) {
@@ -1876,6 +2249,26 @@ function executeBuildTask(credentials, options = {}) {
     );
     const outcome = mutationOutcome(response);
     if (!outcome.businessOk) {
+      const duplicateBuildInfo = isDuplicateBuildInfoMessage(outcome.businessMessage);
+      const duplicateRecovery = duplicateBuildInfo && options.recoverDuplicateBuildInfo !== false
+        ? recoverDuplicateBuildApplyInSession(session, { ...options, codeBranch }, payload.images)
+        : null;
+      if (duplicateRecovery?.ok) {
+        return {
+          ok: true,
+          session: session.login,
+          flowMode,
+          endpoint: "/support/applyProdStruct",
+          recovered: true,
+          payload: duplicateRecovery.payload,
+          originalPayload: payload,
+          versionProbe: generated,
+          response: duplicateRecovery.response,
+          duplicateRecovery,
+          task: duplicateRecovery.task,
+          images: duplicateRecovery.images
+        };
+      }
       return {
         ok: false,
         session: session.login,
@@ -1884,7 +2277,8 @@ function executeBuildTask(credentials, options = {}) {
         payload,
         versionProbe: generated,
         reason: "apply_task_business_failed",
-        duplicateBuildInfo: isDuplicateBuildInfoMessage(outcome.businessMessage),
+        duplicateBuildInfo,
+        duplicateRecovery,
         response: outcome
       };
     }
@@ -2390,13 +2784,15 @@ function probeBuildPlatform(credentials, options = {}) {
       myApplications: {
         total: myAppObject && myAppObject.total,
         rows: arrayOf(myAppObject).map(compactObject),
-        note: fast ? "Fast refresh skipped myApplicationListPage; service list is loaded from namespace + customer/application service APIs, then paged locally by Workbench." : "The real page dispatch payload should still be captured; this probe uses pageSize=15 from reducer defaults."
+        note: fast ? "Fast refresh skipped myApplicationListPage; service list uses the original selectPublishMicroServiceInfo pageNumber/pageSize/imageJenkinsName payload." : "The real page dispatch payload should still be captured; this probe uses pageSize=15 from reducer defaults."
       },
       serviceDiscovery: discoverApplicationServices(session, {
         customerNameEn,
         applicationCodes: options.applicationCodes,
         codeBranch: options.codeBranch,
-        serviceSearch: options.serviceSearch
+        serviceSearch: options.serviceSearch,
+        servicePageNumber: options.servicePageNumber,
+        servicePageSize: options.servicePageSize
       })
     };
   } catch (error) {
@@ -2704,6 +3100,7 @@ module.exports = {
   probeStructureTypeConfigs,
   probeBuildPlatform,
   probeBuildServiceDetail,
+  probeBuildLog,
   probeReleasePlatform,
   verifyTaskBuildPermission
 };
@@ -2713,8 +3110,12 @@ module.exports._internals = {
   exactRequestedImageGroup,
   buildApplyRowMatches,
   buildApplyStatusCandidates,
+  duplicateBuildApplyStatusCandidates,
   isBuildPowerEnabled,
   listBuildApplyGroups,
+  listDuplicateBuildApplyGroups,
+  recoverableDuplicateBuildApplyGroup,
+  buildRecoveryEditImages,
   requestedImagesForTaskLookup,
   requestedImagesFromPermissionOptions,
   isDuplicateBuildInfoMessage,
