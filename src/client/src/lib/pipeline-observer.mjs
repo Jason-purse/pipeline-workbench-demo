@@ -200,6 +200,41 @@ export function buildPlatformPublishSubmittedSignal(applySignal = {}, fallbackTa
   };
 }
 
+export function buildPlatformPublishEnvironmentsFor(branch) {
+  if (branch === "develop") return [];
+  if (branch === "master") return ["0", "1"];
+  return ["1"];
+}
+
+export function buildPlatformPublishProgress({ branch, applySignal, confirmedEnvironments = [] } = {}) {
+  const required = buildPlatformPublishEnvironmentsFor(branch);
+  if (!required.length) return { status: "complete", missingEnvironments: [] };
+  const confirmed = new Set(confirmedEnvironments.map((item) => String(item)));
+  const missingEnvironments = required.filter((environment) => !confirmed.has(environment));
+  if (!missingEnvironments.length) return { status: "complete", missingEnvironments: [] };
+  if (applySignal?.status === "failed") {
+    return {
+      status: "failed",
+      reason: applySignal.reason || "build_apply_failed",
+      missingEnvironments,
+      applySignal
+    };
+  }
+  if (applySignal?.status !== "publish_ready" && applySignal?.status !== "published") {
+    return { status: "waiting", missingEnvironments };
+  }
+  if (applySignal.status === "published" && !confirmed.size) {
+    return { status: "complete", missingEnvironments: [] };
+  }
+  const exposed = String(applySignal.publishEnvironment || "");
+  if (!missingEnvironments.includes(exposed)) return { status: "waiting", missingEnvironments };
+  return {
+    status: "confirm",
+    environment: exposed,
+    missingEnvironments
+  };
+}
+
 export function buildSignalForService(service, detailResult) {
   const rows = Array.isArray(detailResult?.detail) ? detailResult.detail : [];
   const row = rows.find((item) =>

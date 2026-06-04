@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const app = readFileSync(new URL("../src/client/src/App.jsx", import.meta.url), "utf8");
+const server = readFileSync(new URL("../src/server.js", import.meta.url), "utf8");
 
 assert.doesNotMatch(
   app,
@@ -34,6 +35,16 @@ assert.match(app, /function PipelineRunTable\([^)]*\)[\s\S]*paginateRows\(runs,\
 assert.match(app, /pageData\.rows\.map\(\(record\)/, "Pipeline Run table must render only the current page rows");
 assert.match(app, /第 \{pageData\.page\} \/ \{pageData\.totalPages\} 页 · 显示 \{pageData\.start\}-\{pageData\.end\} \/ 共 \{pageData\.total\} 条 Run/, "Pipeline Run table must show front-end pagination summary");
 assert.match(app, /RUN_PAGE_SIZE_OPTIONS\.map/, "Pipeline Run table must expose selectable page sizes");
+assert.match(app, /服务端持久保存最近 \{historyLimit\} 条 Run/, "Pipeline Run table must explain server-side persisted bounded history");
+assert.match(app, /apiFetch\("\/api\/pipeline-runs", \{ runs: runHistory \}\)/, "Pipeline Run history must persist through the server API instead of only localStorage");
+assert.match(app, /apiDelete\("\/api\/pipeline-runs"\)/, "Pipeline Run history must expose a batch-clear server API action");
+assert.match(app, /mergePipelineRunHistories\(data\.pipelineRunHistory \|\| \[\], localHistory\)/, "startup must hydrate server history and migrate same-origin local fallback records");
+assert.doesNotMatch(app, /useState\(\(\) =>\s*[\s\S]{0,120}restorePipelineRunHistory\(window\.localStorage\)/, "Pipeline Run history must not initialize exclusively from port-scoped localStorage");
+assert.match(server, /WORKBENCH_RUN_HISTORY_PATH/, "server must persist Pipeline Run history outside browser origin storage");
+assert.match(server, /pipelineRunHistory:\s*readPipelineRunHistory\(\)/, "bootstrap must hydrate persisted Pipeline Run history");
+assert.match(server, /pathname === "\/api\/pipeline-runs"/, "server must expose Pipeline Run history API endpoints");
+assert.match(server, /pathname === "\/api\/probe\/build-log"/, "server must expose a read-only build log probe for failed build diagnosis");
+assert.match(server, /probeBuildServiceDetail\(credentials,[\s\S]{0,260}imageVersion:\s*body\.imageVersion/, "build-service probe must forward imageVersion so failed-version history is diagnosable");
 assert.doesNotMatch(app, /<Field label="账号">\s*<Select value=\{activeAccountId\}/, "main Pipeline console should not show a separate account selector");
 assert.doesNotMatch(app, /label="医院\/账号"/, "main Pipeline environment band should not display account text");
 assert.doesNotMatch(app, /releaseSummary=\{releaseSummary\}/, "workflow band should not receive the detailed release pending summary badge");
@@ -45,8 +56,10 @@ assert.match(
   /auto-fit,\s*minmax\(min\(100%,\s*240px\),\s*1fr\)/,
   "selector controls should use responsive auto-fit columns instead of fixed minimum columns that overflow beside the activity panel"
 );
-assert.match(app, /serviceListPageInfo/, "Workbench service inventory must use local filtering/pagination after the platform returns the customer/application service set");
-assert.doesNotMatch(app, /servicePageNumber:\s*overrides\.servicePageNumber/, "service discovery payload must not pretend the platform service list is a real paged API");
+assert.match(app, /serverPageInfo/, "Workbench service inventory must render platform-returned page metadata instead of local fake pagination");
+assert.match(app, /servicePageNumber:\s*overrides\.servicePageNumber\s*\?\?\s*servicePage/, "service discovery payload must pass pageNumber through to the platform API");
+assert.match(app, /servicePageSize:\s*overrides\.servicePageSize\s*\?\?\s*servicePageSize/, "service discovery payload must pass pageSize through to the platform API");
+assert.doesNotMatch(app, /serviceListPageInfo/, "Workbench service search must not filter only the current local rows");
 assert.doesNotMatch(app, /platformApplications/, "application selector must not expose the build platform's global application dictionary");
 assert.match(app, /buildCustomerApplications\s*=\s*buildProbe\?\.customerApplications\?\.rows/, "application selector should consume the original build-page customer app list");
 assert.match(app, /\[\.\.\.buildCustomerApplications,\s*\.\.\.releaseApplications,\s*\.\.\.discoveredApplications,\s*\.\.\.profileApplications\]/, "application selector should be customer-scoped: build customer apps, release apps, verified build discovery, then profile fallback");
@@ -79,6 +92,7 @@ assert.match(app, /disabled=\{running \|\| record\.status === "running" \|\| !re
 assert.match(app, /shouldObserveAfterBuildTriggerFailure\(result\)/, "uncertain build trigger failures must enter build observation instead of failing immediately");
 assert.match(app, /构建触发待确认/, "the UI should explain that an uncertain trigger is being observed");
 assert.doesNotMatch(app, /构建触发失败[\s\S]{0,120}updateOutcome\("build", "failed"[\s\S]{0,120}shouldObserveAfterBuildTriggerFailure/, "build trigger must check uncertain/already-running results before marking build failed");
+assert.match(app, /updateOutcome\("build-observe",\s*"failed",\s*message\)/, "when observation detects build failure, build-observe must not remain running");
 assert.match(app, /shouldRestartBuildTaskAfterBuildTriggerFailure\(result\)/, "stale build snapshots must be detected before marking build failed");
 assert.match(app, /staleBuildSnapshot/, "resume logic must carry stale build snapshot state back to task selection");
 assert.match(app, /excludeTaskIds/, "restarted task selection must not immediately reuse the stale build task");
@@ -87,5 +101,7 @@ assert.match(app, /releaseNoopAfterMs/, "new pipeline release observation should
 assert.match(app, /const PIPELINE_RELEASE_OBSERVER_TIMEOUT_MS = 2 \* 60 \* 1000;/, "release record transition should use a short observer budget, not the long build budget");
 assert.doesNotMatch(app, /PIPELINE_RELEASE_OBSERVER_TIMEOUT_MS = 20 \* 60 \* 1000/, "release record transition must not wait twenty minutes after the build-platform handoff");
 assert.match(app, /releaseRecordSignal\(latestApp,\s*\{\s*environmentFound/, "release observation must distinguish a trusted empty environment from an untrusted missing app");
+assert.doesNotMatch(app, /Promise\.all\(releaseStages\.map\(\(stage\) => publishFor\(stage, app, detail\.result\)\)\)/, "master company and spot release-platform stages must not race on one stale detail payload");
+assert.match(app, /for \(const stage of releaseStages\)/, "release-platform stages should run in policy order and refresh detail between stages");
 
 console.log("workbench UI semantics checks passed");

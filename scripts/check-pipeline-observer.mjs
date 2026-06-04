@@ -2,6 +2,8 @@ import assert from "node:assert";
 
 import {
   buildApplySignal,
+  buildPlatformPublishEnvironmentsFor,
+  buildPlatformPublishProgress,
   buildPlatformPublishSubmittedSignal,
   buildSignalForService,
   humanizeFailure,
@@ -212,6 +214,33 @@ assert.strictEqual(buildStillRunning.status, "running", "applyStatus=1 means the
 const buildPublishReady = buildApplySignal({ id: "apply-1", applyStatus: "2", publishEnvironment: "1" });
 assert.strictEqual(buildPublishReady.status, "publish_ready", "applyStatus=2 exposes the build-platform publish button");
 assert.strictEqual(buildPublishReady.publishEnvironment, "1", "publish environment is carried into the confirm publish action");
+
+assert.deepStrictEqual(buildPlatformPublishEnvironmentsFor("develop"), [], "develop does not need build-platform publish confirmation");
+assert.deepStrictEqual(buildPlatformPublishEnvironmentsFor("mastertest"), ["1"], "mastertest needs the build-platform spot publish confirmation");
+assert.deepStrictEqual(buildPlatformPublishEnvironmentsFor("master"), ["0", "1"], "master needs both build-platform company and spot confirmations");
+
+const buildCompanyPublishReady = buildApplySignal({ id: "apply-2", applyStatus: "2", publishEnvironment: "0" });
+const buildSpotPublishReady = buildApplySignal({ id: "apply-2", applyStatus: "2", publishEnvironment: "1" });
+assert.deepStrictEqual(
+  buildPlatformPublishProgress({ branch: "master", applySignal: buildCompanyPublishReady, confirmedEnvironments: [] }),
+  { status: "confirm", environment: "0", missingEnvironments: ["0", "1"] },
+  "master confirms the company build-platform publish button first when the platform exposes it"
+);
+assert.deepStrictEqual(
+  buildPlatformPublishProgress({ branch: "master", applySignal: buildSpotPublishReady, confirmedEnvironments: ["0"] }),
+  { status: "confirm", environment: "1", missingEnvironments: ["1"] },
+  "master must continue to confirm the spot build-platform publish button after company is done"
+);
+assert.deepStrictEqual(
+  buildPlatformPublishProgress({ branch: "master", applySignal: buildCompanyPublishReady, confirmedEnvironments: ["0"] }),
+  { status: "waiting", missingEnvironments: ["1"] },
+  "master must keep observing until the platform exposes the spot build-platform publish button"
+);
+assert.deepStrictEqual(
+  buildPlatformPublishProgress({ branch: "master", applySignal: buildCompanyPublishReady, confirmedEnvironments: ["0", "1"] }),
+  { status: "complete", missingEnvironments: [] },
+  "master build-platform publish is complete only after both company and spot were confirmed"
+);
 
 const buildApplyFailed = buildApplySignal({ id: "apply-1", applyStatus: "3" });
 assert.strictEqual(buildApplyFailed.status, "failed", "applyStatus=3 blocks the pipeline at build task failure");

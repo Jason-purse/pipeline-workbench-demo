@@ -44,6 +44,24 @@ function imageMatchesServiceIdentity(image, service) {
   return imageMatchesService(image, service, { ignoreVersion: true });
 }
 
+function serviceVersionOf(service) {
+  return service?.generatedVersion || service?.imageVersion || "";
+}
+
+function imageMatchesServiceExactVersion(image, service) {
+  const expectedVersion = serviceVersionOf(service);
+  if (!expectedVersion) return false;
+  return (
+    imageMatchesServiceIdentity(image, service) &&
+    image?.imageVersion === expectedVersion
+  );
+}
+
+function editableApplyStatus(task) {
+  if (!task?.pendingApply) return false;
+  return ["0", "4"].includes(String(task.applyStatus ?? ""));
+}
+
 export function isBuildPowerEnabled(value) {
   return String(value) === "0";
 }
@@ -89,6 +107,42 @@ export function serviceGroupMismatchText(snapshot, services) {
   if (snapshot.extraServices?.length) parts.push(`多出 ${snapshot.extraServices.join(" / ")}`);
   if (snapshot.versionMismatches?.length) parts.push(`版本不一致 ${snapshot.versionMismatches.join(" / ")}`);
   return parts.join("；") || `当前选择 ${selectedServicesText(services)} 与已有任务服务组不一致`;
+}
+
+export function recoverableEditBlockerFor(group, services) {
+  const task = group?.task || null;
+  const images = group?.images || [];
+  const targetServices = services
+    .map((service) => service?.imageJenkinsName || service?.imageNameEn)
+    .filter(Boolean);
+  const extraServices = images
+    .filter((image) => !services.some((service) => imageMatchesServiceIdentity(image, service)))
+    .map(imageLabel);
+  const matchedBlockerServices = services
+    .filter((service) => images.some((image) => imageMatchesServiceExactVersion(image, service)))
+    .map((service) => service.imageJenkinsName || service.imageNameEn)
+    .filter(Boolean);
+  const missingTargetServices = services
+    .filter((service) => !images.some((image) => imageMatchesServiceIdentity(image, service)))
+    .map((service) => service.imageJenkinsName || service.imageNameEn)
+    .filter(Boolean);
+  const recoverable = editableApplyStatus(task) && matchedBlockerServices.length > 0;
+  const reason = recoverable
+    ? "editable_exact_version_blocker"
+    : !editableApplyStatus(task)
+    ? "task_not_editable"
+    : "no_exact_version_blocker";
+
+  return {
+    task,
+    images,
+    recoverable,
+    reason,
+    matchedBlockerServices,
+    missingTargetServices,
+    extraServices,
+    targetServices
+  };
 }
 
 export function taskSnapshotFor(result, services, options = {}) {

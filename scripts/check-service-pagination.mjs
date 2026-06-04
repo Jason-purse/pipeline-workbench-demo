@@ -6,6 +6,7 @@ import {
   paginateRows,
   paginationItems,
   removeSelectedServiceKey,
+  serverPageInfo,
   serviceListPageInfo
 } from "../src/client/src/lib/service-pagination.mjs";
 
@@ -72,25 +73,36 @@ assert.deepEqual(
   "selected service can be removed from an independent selected-services area"
 );
 assert.deepEqual(
+  serverPageInfo({
+    rows: serviceRows.slice(20, 27),
+    total: 27,
+    pageNo: 3,
+    pageSize: 10
+  }),
+  {
+    rows: serviceRows.slice(20, 27),
+    page: 3,
+    pageSize: 10,
+    total: 27,
+    totalPages: 3,
+    start: 21,
+    end: 27,
+    hasPrev: true,
+    hasNext: false,
+    serverPaged: true
+  },
+  "service inventory renders the platform-returned page without local fake pagination"
+);
+
+assert.equal(
   serviceListPageInfo({
     rows: serviceRows,
     search: "2",
     page: 2,
     pageSize: 5
-  }),
-  {
-    rows: serviceRows.slice(22, 27),
-    page: 2,
-    pageSize: 5,
-    total: 10,
-    totalPages: 2,
-    start: 6,
-    end: 10,
-    hasPrev: true,
-    hasNext: false,
-    search: "2"
-  },
-  "service inventory is fetched as the current customer/application set, then filtered and paged locally"
+  }).total,
+  10,
+  "legacy local page helper remains available for non-platform local lists"
 );
 
 console.log("service pagination checks passed");

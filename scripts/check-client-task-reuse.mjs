@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   isBuildPowerEnabled,
+  recoverableEditBlockerFor,
   selectedServicesText,
   serviceGroupMismatchText,
   taskSnapshotFor
@@ -110,5 +111,33 @@ assert.equal(
   "outpatweb-mem-ewell-mastertest / prescription-mem-ewell-mastertest",
   "Run table and logs must list the complete multi-service group instead of only showing a count"
 );
+
+const recoverableExtraServiceBlocker = recoverableEditBlockerFor({
+  task: { id: "apply-editable", pendingApply: true, applyStatus: "0" },
+  images: [
+    { imageJenkinsName: "unrelated-mem-ewell-mastertest", imageNameEn: "unrelated-mem-ewell", imageVersion: "v9.99.001" },
+    { ...prescription, imageVersion: "v1.56.001" }
+  ]
+}, [outpatweb, prescription]);
+assert.equal(recoverableExtraServiceBlocker.recoverable, true);
+assert.deepEqual(recoverableExtraServiceBlocker.matchedBlockerServices, ["prescription-mem-ewell-mastertest"]);
+assert.deepEqual(recoverableExtraServiceBlocker.extraServices, ["unrelated-mem-ewell-mastertest"]);
+assert.deepEqual(
+  recoverableExtraServiceBlocker.targetServices,
+  ["outpatweb-mem-ewell-mastertest", "prescription-mem-ewell-mastertest"],
+  "recovery must edit the apply to the exact current pipeline service group"
+);
+
+const runningApplyBlocker = recoverableEditBlockerFor({
+  task: { id: "apply-running", pendingApply: true, applyStatus: "1" },
+  images: [{ ...prescription, imageVersion: "v1.56.001" }]
+}, [prescription]);
+assert.equal(runningApplyBlocker.recoverable, false);
+
+const oldVersionBlocker = recoverableEditBlockerFor({
+  task: { id: "apply-old", pendingApply: true, applyStatus: "0" },
+  images: [{ ...prescription, imageVersion: "v1.55.001" }]
+}, [prescription]);
+assert.equal(oldVersionBlocker.recoverable, false);
 
 console.log("client task reuse checks passed");

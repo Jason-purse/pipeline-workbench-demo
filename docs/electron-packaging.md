@@ -1,6 +1,6 @@
 # Electron 打包说明
 
-本文只描述 Pipeline Workbench 产物的运行和打包步骤，不包含会话探索记录、技能设计记录或平台抓包临时产物。
+本文只描述 Build & Release Workbench 产物的运行和打包步骤，不包含会话探索记录、技能设计记录或平台抓包临时产物。
 
 ## 前置条件
 
@@ -30,7 +30,7 @@ npm run electron:pack:win
 
 当前 Electron Builder 配置包含：
 
-- `win-unpacked/`：免安装目录包，可直接运行 `Pipeline Workbench.exe`。
+- `win-unpacked/`：免安装目录包，可直接运行 `Build & Release Workbench.exe`。
 - NSIS 安装包：适合分发给普通用户安装。
 - portable 包：适合无安装运行。
 

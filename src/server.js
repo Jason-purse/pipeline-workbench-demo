@@ -36,6 +36,7 @@ const {
   getCurrentAppPublishDetail,
   listBuildTasks,
   probeBuildApply,
+  probeBuildLog,
   probeBuildPlatform,
   probeImageVersion,
   probeStructureTypeConfigs,
@@ -47,6 +48,11 @@ const {
 const PORT = Number(process.env.PORT || 4173);
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 const SECRETS_PATH = process.env.WORKBENCH_SECRETS_PATH || path.join(__dirname, "..", ".workbench-secrets.json");
+const CACHE_DIR = process.env.WORKBENCH_CACHE_DIR || path.join(__dirname, "..", ".workbench-cache");
+const RUN_HISTORY_PATH = process.env.WORKBENCH_RUN_HISTORY_PATH || path.join(CACHE_DIR, "pipeline-run-history.json");
+const configuredRunHistoryLimit = Number(process.env.WORKBENCH_RUN_HISTORY_LIMIT || 80);
+const RUN_HISTORY_LIMIT = Number.isFinite(configuredRunHistoryLimit) ? Math.max(10, configuredRunHistoryLimit) : 80;
+const MAX_JSON_BODY_BYTES = 5 * 1024 * 1024;
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -92,6 +98,99 @@ function writeSecrets(secrets) {
   };
   fs.mkdirSync(path.dirname(SECRETS_PATH), { recursive: true, mode: 0o700 });
   fs.writeFileSync(SECRETS_PATH, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+}
+
+function cloneJson(value, fallback) {
+  if (value == null) return fallback;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function epochMs(value) {
+  const time = new Date(value || "").getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function normalizeRunHistoryRecord(record = {}) {
+  const timestamp = new Date().toISOString();
+  const createdAt = String(record.createdAt || timestamp);
+  const updatedAt = String(record.updatedAt || createdAt);
+  const id = String(record.id || createdAt);
+  return {
+    id,
+    copiedFromRunId: String(record.copiedFromRunId || ""),
+    createdAt,
+    updatedAt,
+    completedAt: String(record.completedAt || ""),
+    started: record.started !== false,
+    templateId: String(record.templateId || "build-and-release"),
+    status: String(record.status || "draft"),
+    phase: String(record.phase || "待选择"),
+    target: cloneJson(record.target || {}, {}),
+    releaseReason: String(record.releaseReason || "功能更新"),
+    releaseNotice: String(record.releaseNotice || "测试"),
+    serviceSnapshot: cloneJson(asArray(record.serviceSnapshot), []),
+    buildSnapshot: cloneJson(record.buildSnapshot || null, null),
+    outcomes: cloneJson(record.outcomes || {}, {}),
+    activity: cloneJson(asArray(record.activity), []).slice(0, 120),
+    resumeStage: String(record.resumeStage || "")
+  };
+}
+
+function sortAndLimitRunHistory(records, limit = RUN_HISTORY_LIMIT) {
+  return asArray(records)
+    .map(normalizeRunHistoryRecord)
+    .sort((left, right) => {
+      const rightTime = epochMs(right.updatedAt || right.createdAt);
+      const leftTime = epochMs(left.updatedAt || left.createdAt);
+      if (rightTime !== leftTime) return rightTime - leftTime;
+      return String(right.id).localeCompare(String(left.id));
+    })
+    .slice(0, limit);
+}
+
+function readPipelineRunHistory() {
+  if (!fs.existsSync(RUN_HISTORY_PATH)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RUN_HISTORY_PATH, "utf8"));
+    const records = Array.isArray(parsed) ? parsed : parsed.runs;
+    return sortAndLimitRunHistory(records);
+  } catch {
+    return [];
+  }
+}
+
+function writePipelineRunHistory(records) {
+  const runs = sortAndLimitRunHistory(records);
+  fs.mkdirSync(path.dirname(RUN_HISTORY_PATH), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(RUN_HISTORY_PATH, `${JSON.stringify({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    limit: RUN_HISTORY_LIMIT,
+    runs
+  }, null, 2)}\n`, { mode: 0o600 });
+  return runs;
+}
+
+function upsertPipelineRunHistory(record) {
+  const incoming = normalizeRunHistoryRecord(record);
+  return writePipelineRunHistory([
+    incoming,
+    ...readPipelineRunHistory().filter((item) => item.id !== incoming.id)
+  ]);
+}
+
+function deletePipelineRunHistory(ids) {
+  const keepIds = new Set(asArray(ids).map(String).filter(Boolean));
+  if (!keepIds.size) return writePipelineRunHistory([]);
+  return writePipelineRunHistory(readPipelineRunHistory().filter((item) => !keepIds.has(item.id)));
 }
 
 function activeProfiles() {
@@ -295,7 +394,6 @@ function deleteWorkflowProfile(profileId) {
   const currentProfiles = activeProfiles();
   const profile = currentProfiles.find((item) => item.id === id);
   if (!profile) throw codedError("workflow 不存在或已删除。", "workflow_not_found");
-  if (currentProfiles.length <= 1) throw codedError("至少保留一个 workflow。", "workflow_delete_last_forbidden");
 
   const secrets = readSecrets();
   const dynamicProfiles = Array.isArray(secrets.customWorkflowProfiles) ? secrets.customWorkflowProfiles : [];
@@ -407,7 +505,7 @@ function readBody(req) {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1024 * 1024) {
+      if (body.length > MAX_JSON_BODY_BYTES) {
         reject(new Error("request body too large"));
         req.destroy();
       }
@@ -626,8 +724,46 @@ async function handleApi(req, res, pathname) {
       platforms,
       profiles: activeProfiles(),
       credentialState: credentialState(),
+      pipelineRunHistory: readPipelineRunHistory(),
+      pipelineRunHistoryLimit: RUN_HISTORY_LIMIT,
       stateLabels,
       tasks
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/pipeline-runs") {
+    sendJson(res, 200, {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      limit: RUN_HISTORY_LIMIT,
+      runs: readPipelineRunHistory()
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/pipeline-runs") {
+    const body = await readBody(req);
+    const runs = Array.isArray(body.runs)
+      ? writePipelineRunHistory(body.runs)
+      : body.run
+        ? upsertPipelineRunHistory(body.run)
+        : readPipelineRunHistory();
+    sendJson(res, 200, {
+      ok: true,
+      limit: RUN_HISTORY_LIMIT,
+      runs
+    });
+    return;
+  }
+
+  if (req.method === "DELETE" && pathname === "/api/pipeline-runs") {
+    const body = await readBody(req);
+    const runs = deletePipelineRunHistory(body.ids);
+    sendJson(res, 200, {
+      ok: true,
+      limit: RUN_HISTORY_LIMIT,
+      runs
     });
     return;
   }
@@ -676,7 +812,8 @@ async function handleApi(req, res, pathname) {
     }
     const result = discoverBuildWorkflowCustomers({ username, password });
     if (!result.ok) {
-      sendJson(res, 502, { ok: false, error: result.reason || "workflow_customer_discovery_failed", message: result.message || result.error || "构建平台客户探测失败", result });
+      const detail = result.message || result.error || result.session?.message || result.session?.login?.message || "构建平台客户探测失败";
+      sendJson(res, 502, { ok: false, error: result.reason || "workflow_customer_discovery_failed", message: detail, result });
       return;
     }
     sendJson(res, 200, {
@@ -766,7 +903,9 @@ async function handleApi(req, res, pathname) {
         applicationCodes: body.applicationCode ? [body.applicationCode] : profile.applications.map((app) => app.code),
         codeBranch: body.codeBranch,
         fast: body.fast !== false,
-        serviceSearch: body.serviceSearch
+        serviceSearch: body.serviceSearch,
+        servicePageNumber: body.servicePageNumber,
+        servicePageSize: body.servicePageSize
       })
     });
     return;
@@ -799,7 +938,42 @@ async function handleApi(req, res, pathname) {
         customerNameEn: body.customerNameEn || profile.customerNameEn,
         applicationCode: body.applicationCode,
         codeBranch: body.codeBranch,
-        imageJenkinsName: body.imageJenkinsName
+        imageJenkinsName: body.imageJenkinsName,
+        imageVersion: body.imageVersion
+      })
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/probe/build-log") {
+    const body = await readBody(req);
+    const profile = activeProfile(body.profileId);
+    if (!profile) {
+      sendJson(res, 404, { ok: false, error: "profile_not_found" });
+      return;
+    }
+    const credentials = resolveAccount(profile, body);
+    if (!credentials) {
+      sendJson(res, 404, { ok: false, error: "account_not_found" });
+      return;
+    }
+    if (credentials.missing) {
+      sendMissingCredentials(res, profile, credentials);
+      return;
+    }
+    if (!allowedApplication(profile, body.applicationCode)) {
+      sendJson(res, 400, { ok: false, error: "application_not_allowed" });
+      return;
+    }
+    sendJson(res, 200, {
+      profileId: profile.id,
+      accountId: body.accountId,
+      result: probeBuildLog(credentials, {
+        customerNameEn: body.customerNameEn || profile.customerNameEn,
+        applicationCode: body.applicationCode,
+        codeBranch: body.codeBranch,
+        imageJenkinsName: body.imageJenkinsName,
+        buildID: body.buildID || body.buildId
       })
     });
     return;
@@ -1346,7 +1520,8 @@ async function handleApi(req, res, pathname) {
         deploymentDescribe: body.deploymentDescribe,
         deploymentExplain: body.deploymentExplain,
         envName: body.envName,
-        buildImages
+        buildImages,
+        recoverDuplicateBuildInfo: body.recoverDuplicateBuildInfo !== false
       })
     });
     return;
@@ -1478,8 +1653,16 @@ function startServer(options = {}) {
 }
 
 if (require.main === module) {
-  startServer().then(({ url }) => {
+  startServer().then(({ url, port, host }) => {
     console.log(`Hospital Release Workbench MVP listening on ${url}`);
+    if (process.send) {
+      process.send({
+        type: "workbench-server-ready",
+        url,
+        port,
+        host
+      });
+    }
   }).catch((error) => {
     console.error(error);
     process.exitCode = 1;

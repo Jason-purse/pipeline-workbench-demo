@@ -1,5 +1,5 @@
 export const PIPELINE_RUN_HISTORY_KEY = "pipeline-run-history-v1";
-export const PIPELINE_RUN_HISTORY_LIMIT = 30;
+export const PIPELINE_RUN_HISTORY_LIMIT = 80;
 export const DEFAULT_RELEASE_REASON = "功能更新";
 export const DEFAULT_RELEASE_NOTICE = "测试";
 export const RUNNING_STALE_AFTER_MS = 60 * 60 * 1000;
@@ -8,6 +8,24 @@ const TERMINAL_SUCCESS = new Set(["done", "cancelled"]);
 const RESUMABLE_STATUS = new Set(["draft", "blocked", "failed"]);
 const BAD_STATUS_PRIORITY = ["failed", "blocked", "running"];
 const SERVICE_ROW_PIPELINE_IDS = ["build-and-release", "build-only"];
+const RELEASE_RESUME_POINTS = [
+  { id: "release", pipelineId: "release", stage: "release", stageId: "publish", stepId: "complete-release", phase: "发布" },
+  { id: "publish-spot", pipelineId: "release", stage: "release", stageId: "publish", stepId: "publish-spot", phase: "现场发布" },
+  { id: "publish-company", pipelineId: "release", stage: "release", stageId: "publish", stepId: "publish-company", phase: "公司发布" },
+  { id: "release-detail", pipelineId: "release", stage: "release", stageId: "release-detail", stepId: "read-release-detail", phase: "发布清单" },
+  { id: "release-observe", pipelineId: "release", stage: "release", stageId: "release-observe", stepId: "wait-release-record", phase: "等待发布记录" }
+];
+const BUILD_RESUME_POINTS = [
+  { id: "build-platform-publish", pipelineId: "build", stage: "build", stageId: "build-platform-publish", stepId: "confirm-build-platform-publish", phase: "构建平台发布" },
+  { id: "build-apply-observe", pipelineId: "build", stage: "build", stageId: "build-observe", stepId: "observe-build-apply", phase: "等待构建完成" },
+  { id: "build-observe", pipelineId: "build", stage: "build", stageId: "build-observe", stepId: "observe-build", phase: "等待构建完成" },
+  { id: "build", pipelineId: "build", stage: "build", stageId: "build", stepId: "trigger-build", phase: "构建" },
+  { id: "build-task", pipelineId: "build", stage: "build", stageId: "build-task", stepId: "wait-buildable-task", phase: "等待构建任务" },
+  { id: "create-task", pipelineId: "build", stage: "build", stageId: "build-task", stepId: "create-or-reuse-task", phase: "创建构建任务" },
+  { id: "version", pipelineId: "build", stage: "build", stageId: "prepare", stepId: "generate-version", phase: "版本预检" },
+  { id: "build-status", pipelineId: "build", stage: "build", stageId: "prepare", stepId: "read-build-status", phase: "构建预检" },
+  { id: "probe", pipelineId: "build", stage: "prepare", stageId: "prepare", stepId: "probe-platforms", phase: "构建预检" }
+];
 
 function nowIso() {
   return new Date().toISOString();
@@ -60,6 +78,44 @@ function normalizeStaleRunningRecord(record = {}) {
       tone: "warning"
     }, ...asArray(record.activity || [])].slice(0, 120)
   };
+}
+
+function normalizeContradictoryOutcomes(record = {}) {
+  const outcomes = cloneJson(record.outcomes || {}, {});
+  const buildStatus = outcomes.build?.status;
+  if ((buildStatus === "failed" || buildStatus === "blocked") && outcomes["build-observe"]?.status === "running") {
+    outcomes["build-observe"] = {
+      ...outcomes["build-observe"],
+      status: buildStatus,
+      detail: outcomes.build.detail || outcomes["build-observe"].detail || "构建阶段已失败。"
+    };
+  }
+  const releaseStatus = outcomes.release?.status;
+  if ((releaseStatus === "failed" || releaseStatus === "blocked") && outcomes["release-observe"]?.status === "running") {
+    outcomes["release-observe"] = {
+      ...outcomes["release-observe"],
+      status: releaseStatus,
+      detail: outcomes.release.detail || outcomes["release-observe"].detail || "发布阶段已暂停。"
+    };
+  }
+  return { ...record, outcomes };
+}
+
+function normalizePhaseForResumeStage(record = {}, resumePoint) {
+  const phase = record.phase || "待选择";
+  if (record.status === "failed" || record.status === "blocked") {
+    if (resumePoint?.stage === "build") {
+      if (resumePoint.id === "build" || resumePoint.id === "build-observe" || resumePoint.id === "build-apply-observe") {
+        return record.status === "failed" ? "构建失败" : "等待构建完成";
+      }
+      return resumePoint.phase || "等待构建完成";
+    }
+    if (resumePoint?.stage === "release") {
+      return resumePoint.phase || "等待发布记录";
+    }
+  }
+  if (resumePoint?.stage === "build" && /发布/.test(phase)) return resumePoint.phase || "等待构建完成";
+  return phase;
 }
 
 function asArray(value) {
@@ -123,11 +179,12 @@ function firstStatus(outcomes, ids, statuses = BAD_STATUS_PRIORITY) {
 
 function buildPhaseStatus(record = {}) {
   const outcomes = record.outcomes || {};
-  const fatal = firstStatus(outcomes, ["build", "build-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["failed", "blocked"]);
+  const fatal = firstStatus(outcomes, ["build", "build-observe", "build-apply-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["failed", "blocked"]);
   if (fatal) return fatal.status;
+  if (outcomes["build-apply-observe"]?.status) return outcomes["build-apply-observe"].status;
   if (outcomes["build-observe"]?.status) return outcomes["build-observe"].status;
   if (record.status === "done" && (record.templateId === "build-only" || outcomes.release?.status === "done")) return "done";
-  const active = firstStatus(outcomes, ["build", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["running"]);
+  const active = firstStatus(outcomes, ["build", "build-observe", "build-apply-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["running"]);
   if (active) return "running";
   if (outcomes.build?.status === "done") return "running";
   if (outcomes["create-task"]?.status === "done" || outcomes["build-task"]?.status === "done" || outcomes.version?.status === "done") return "running";
@@ -216,9 +273,10 @@ function normalizeTarget(target = {}) {
 
 export function normalizePipelineRunRecord(record = {}) {
   const timestamp = nowIso();
-  const source = normalizeStaleRunningRecord(record);
+  const source = normalizeContradictoryOutcomes(normalizeStaleRunningRecord(record));
   const createdAt = record.createdAt || timestamp;
   const updatedAt = record.updatedAt || createdAt;
+  const resumePoint = inferResumePoint(source);
   return {
     id: source.id || createdAt,
     copiedFromRunId: source.copiedFromRunId || "",
@@ -228,7 +286,7 @@ export function normalizePipelineRunRecord(record = {}) {
     started: source.started !== false,
     templateId: source.templateId || "build-and-release",
     status: source.status || "draft",
-    phase: source.phase || "待选择",
+    phase: normalizePhaseForResumeStage(source, resumePoint),
     target: normalizeTarget(source.target),
     releaseReason: source.releaseReason || DEFAULT_RELEASE_REASON,
     releaseNotice: source.releaseNotice || DEFAULT_RELEASE_NOTICE,
@@ -236,7 +294,8 @@ export function normalizePipelineRunRecord(record = {}) {
     buildSnapshot: cloneJson(source.buildSnapshot, null),
     outcomes: cloneJson(source.outcomes || {}, {}),
     activity: cloneJson(asArray(source.activity), []).slice(0, 120),
-    resumeStage: source.resumeStage || inferResumeStage(source)
+    resumePoint,
+    resumeStage: resumePoint.stage
   };
 }
 
@@ -260,27 +319,58 @@ export function upsertPipelineRunRecord(records, record, options = {}) {
     .slice(0, limit);
 }
 
+export function mergePipelineRunHistories(...sources) {
+  let records = [];
+  for (const source of sources) {
+    for (const record of asArray(source)) {
+      records = upsertPipelineRunRecord(records, record);
+    }
+  }
+  return records;
+}
+
 export function canResumePipelineRun(record = {}) {
   if (TERMINAL_SUCCESS.has(record.status)) return false;
   if (RESUMABLE_STATUS.has(record.status)) return true;
   return Object.values(record.outcomes || {}).some((outcome) => RESUMABLE_STATUS.has(outcome?.status));
 }
 
-export function inferResumeStage(record = {}) {
-  const outcomes = record.outcomes || {};
-  const hasOutcome = (...ids) => ids.some((id) => Boolean(outcomes[id]));
-  const hasBadOutcome = (...ids) => ids.some((id) => {
-    const status = outcomes[id]?.status;
-    return status === "blocked" || status === "failed" || status === "running";
-  });
+export function blockedPhaseForPipelineError(error) {
+  const text = String(error || "");
+  if (/^build_|build.*timeout|build.*failed|build.*observe/i.test(text)) return "等待构建完成";
+  if (/^release_|^publish_|release.*timeout|publish.*timeout/i.test(text)) return "等待发布记录";
+  return "等待处理";
+}
 
-  if (hasBadOutcome("release", "release-observe", "release-detail", "publish-company", "publish-spot")) return "release";
-  if (outcomes.release?.status === "done") return "complete";
-  if (record.buildSnapshot && (outcomes.build?.status === "done" || hasOutcome("build-observe", "build-platform-publish"))) return "release";
-  if (hasBadOutcome("build", "build-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status")) return "build";
-  if (outcomes["create-task"]?.status === "done" || outcomes["build-task"]?.status === "done") return "build";
-  if (hasBadOutcome("probe")) return "prepare";
-  return record.status === "done" ? "complete" : "start";
+export function inferResumePoint(record = {}) {
+  const outcomes = record.outcomes || {};
+  const pointGroups = [BUILD_RESUME_POINTS, RELEASE_RESUME_POINTS];
+  for (const points of pointGroups) {
+    const point = points.find((definition) => {
+      const status = outcomes[definition.id]?.status;
+      return status === "failed" || status === "blocked" || status === "running";
+    });
+    if (!point) continue;
+    const outcome = outcomes[point.id];
+    return {
+      ...point,
+      status: outcome.status,
+      detail: outcome.detail || ""
+    };
+  }
+  if (outcomes.release?.status === "done") return { id: "complete", stage: "complete", phase: "完成", status: "done" };
+  if (record.buildSnapshot && (outcomes.build?.status === "done" || outcomes["build-observe"] || outcomes["build-platform-publish"])) {
+    return { id: "release-observe", stage: "release", phase: "等待发布记录", status: "pending" };
+  }
+  if (outcomes["create-task"]?.status === "done" || outcomes["build-task"]?.status === "done") {
+    return { id: "build", stage: "build", phase: "构建", status: "pending" };
+  }
+  if (record.status === "done") return { id: "complete", stage: "complete", phase: "完成", status: "done" };
+  return { id: "start", stage: "start", phase: "待启动", status: record.status || "draft" };
+}
+
+export function inferResumeStage(record = {}) {
+  return inferResumePoint(record).stage;
 }
 
 export function clonePipelineRunDraft(record = {}) {
