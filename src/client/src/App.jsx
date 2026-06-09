@@ -31,6 +31,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
+  buildLogOutcome,
+  buildLogText,
+  normalizeBuildStageLabel,
+  pickBuildStructureRecord,
+  parseBuildStructureStages,
+  parseBuildLogStages
+} from "@/lib/build-stage-log.mjs";
+import {
   DEFAULT_SERVICE_PAGE_SIZE,
   SERVICE_PAGE_SIZE_OPTIONS,
   paginateRows,
@@ -40,11 +48,13 @@ import {
 } from "@/lib/service-pagination.mjs";
 import {
   buildApplySignal,
+  buildObservationBaselineForService,
   buildPlatformPublishEnvironmentsFor,
   buildPlatformPublishProgress,
   buildPlatformPublishSubmittedSignal,
   buildSignalForService,
   humanizeFailure,
+  isBuildAlreadyRunningResult,
   isRetryableProbeResult,
   pipelineObservationDecision,
   publishableServicesForStage,
@@ -54,6 +64,8 @@ import {
   shouldRestartBuildTaskAfterBuildTriggerFailure
 } from "@/lib/pipeline-observer.mjs";
 import { selectedServicesText, serviceGroupMismatchText, taskIdOf, taskSnapshotFor } from "@/lib/task-reuse.mjs";
+import { buildPipelineRun } from "@/lib/pipeline-run-builder.mjs";
+import { applyCommandEventToMemento } from "@/lib/pipeline-run-memento.mjs";
 import {
   buildMode,
   canResumePipelineRun,
@@ -62,7 +74,7 @@ import {
   DEFAULT_RELEASE_NOTICE,
   DEFAULT_RELEASE_REASON,
   blockedPhaseForPipelineError,
-  inferResumeStage,
+  inferResumePoint,
   mergePipelineRunHistories,
   normalizePipelineRunRecord,
   phaseCardsForRunRecord,
@@ -132,9 +144,24 @@ const READ_RETRY_ATTEMPTS = 3;
 const READ_RETRY_DELAY_MS = 1200;
 const RUN_PAGE_SIZE_OPTIONS = [5, 10, 20];
 const DEFAULT_RUN_PAGE_SIZE = 5;
+const BUILD_DETAIL_STAGES = [
+  { id: "extract", label: "Extract", name: "拉取源码" },
+  { id: "verify", label: "Verify", name: "环境校验" },
+  { id: "maven", label: "Maven Build", name: "Maven 构建" },
+  { id: "docker", label: "Docker Build", name: "镜像构建" },
+  { id: "chart", label: "Chart Deploy", name: "Chart 部署" },
+  { id: "meta", label: "Meta Parse", name: "元数据解析" }
+];
+
+const BUILD_STAGE_NAME_BY_LABEL = new Map(BUILD_DETAIL_STAGES.map((stage) => [normalizeBuildStageLabel(stage.label), stage.name]));
+BUILD_STAGE_NAME_BY_LABEL.set("npm build", "Npm 构建");
 
 function serviceName(row) {
   return row?.imageJenkinsName || row?.serviceNameEn || row?.microServiceName || row?.serviceName || "unknown-service";
+}
+
+function serviceDisplayName(row) {
+  return row?.imageJenkinsName || row?.imageNameEn || row?.serviceNameEn || row?.microServiceName || row?.serviceName || "unknown-service";
 }
 
 function serviceKey(row, profile, appCode, branch) {
@@ -148,6 +175,13 @@ function serviceKey(row, profile, appCode, branch) {
 
 function nowText() {
   return new Date().toLocaleString("zh-CN", { hour12: false });
+}
+
+function touchRunRecord(record = {}) {
+  return {
+    ...record,
+    updatedAt: new Date().toISOString()
+  };
 }
 
 function durationText(ms) {
@@ -170,6 +204,585 @@ function isDuplicateBuildInfoMessage(message) {
 
 function buildPowerLabel(value) {
   return `buildPower=${value ?? "-"}${String(value) === "0" ? "（可构建）" : "（不可构建）"}`;
+}
+
+function directBuildBaselineKey(service = {}) {
+  return service.serviceKey || service.imageJenkinsName || service.imageNameEn || service.serviceNameEn || service.serviceName || "";
+}
+
+function directBuildBaselineForServices(services = []) {
+  const baselines = {};
+  for (const service of services) {
+    const key = directBuildBaselineKey(service);
+    if (key) baselines[key] = buildObservationBaselineForService(service, service.detail);
+  }
+  return baselines;
+}
+
+function directBuildBaselineForService(service = {}, baselines = {}) {
+  if (!baselines) return null;
+  return baselines[directBuildBaselineKey(service)] ||
+    baselines[service.imageJenkinsName] ||
+    baselines[service.imageNameEn] ||
+    null;
+}
+
+function serviceBuildStatusItemKey(service = {}, index = 0) {
+  return `${serviceDisplayName(service)}-${index}`;
+}
+
+function compactSignalStructureBuildRecord(record = {}) {
+  const stages = Array.isArray(record.stages) ? record.stages : [];
+  return {
+    ...(record.id != null ? { id: record.id } : {}),
+    ...(record.name != null ? { name: record.name } : {}),
+    ...(record.buildID != null ? { buildID: record.buildID } : {}),
+    ...(record.buildId != null ? { buildId: record.buildId } : {}),
+    ...(record.imageVersion != null ? { imageVersion: record.imageVersion } : {}),
+    ...(record.status != null ? { status: record.status } : {}),
+    stages: stages.map((stage) => ({
+      ...(stage.id != null ? { id: stage.id } : {}),
+      stageName: stage.stageName || stage.name || "",
+      status: stage.status || "",
+      ...(stage.duration != null ? { duration: stage.duration } : {}),
+      ...(stage.durationMillis != null ? { durationMillis: stage.durationMillis } : {}),
+      ...(stage.startTimeMillis != null ? { startTimeMillis: stage.startTimeMillis } : {})
+    }))
+  };
+}
+
+function compactSignalStructureDetail(structureDetail = null, signal = {}) {
+  if (!structureDetail || typeof structureDetail !== "object") return null;
+  const definition = compactStructureDetail(structureDetail);
+  const hints = [
+    signal.buildId,
+    signal.candidateBuildId,
+    ...(Array.isArray(signal.candidateBuildIds) ? signal.candidateBuildIds : [])
+  ].map(buildNumberText).filter(Boolean);
+  const hintSet = new Set(hints);
+  const records = Array.isArray(structureDetail.pineLines) ? structureDetail.pineLines : [];
+  const selectedRecords = (hintSet.size
+    ? records.filter((record) => hintSet.has(buildNumberText(record.id || record.name || record.buildID || record.buildId)))
+    : records.slice(0, 1)
+  ).slice(0, 5);
+  if (!definition && !selectedRecords.length) return null;
+  return {
+    ...(definition || {}),
+    pineLines: selectedRecords.map(compactSignalStructureBuildRecord)
+  };
+}
+
+function compactBuildSignals(signals = []) {
+  return signals.map((signal) => {
+    const candidateBuildIds = Array.isArray(signal.candidateBuildIds)
+      ? signal.candidateBuildIds.filter(Boolean).map(String).slice(0, 5)
+      : [];
+    const compactStructure = compactSignalStructureDetail(signal.structureDetail, {
+      ...signal,
+      candidateBuildIds
+    });
+    return {
+      service: signal.service || "",
+      status: signal.status || "running",
+      version: signal.version || "",
+      buildId: signal.buildId || "",
+      candidateBuildId: signal.candidateBuildId || candidateBuildIds[0] || "",
+      candidateBuildIds,
+      at: signal.at || 0,
+      reason: signal.reason || "",
+      ...(compactStructure ? { structureDetail: compactStructure } : {})
+    };
+  });
+}
+
+function formatBuildMarkerTime(value) {
+  const numeric = Number(value || 0);
+  if (!numeric) return "";
+  const date = new Date(numeric);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatBuildMarker(id, at) {
+  return [id, formatBuildMarkerTime(at)].filter(Boolean).join(" / ") || "-";
+}
+
+function buildStatusReasonText(reason) {
+  const labels = {
+    missing_build_detail: "平台暂未返回服务行",
+    waiting_for_success: "等待新成功标记",
+    waiting_for_target_version: "等待目标版本",
+    last_failure_newer_than_success: "发现新失败标记",
+    build_failed: "构建失败",
+    build_running: "构建观察中",
+    direct_build_already_running: "平台提示已有构建"
+  };
+  return labels[reason] || reason || "等待构建平台回写状态";
+}
+
+function serviceSignalNames(service = {}) {
+  return [
+    service.imageJenkinsName,
+    service.imageNameEn,
+    service.serviceNameEn,
+    service.serviceName,
+    service.serviceKey
+  ].filter(Boolean).map(String);
+}
+
+function buildSignalForDisplay(service = {}, signals = []) {
+  const names = new Set(serviceSignalNames(service));
+  return signals.find((signal) => names.has(String(signal.service || ""))) || null;
+}
+
+function buildCommandSnapshot(record = {}, statuses = ["failed", "blocked", "running", "done"]) {
+  const commands = record.memento?.commands || {};
+  const ids = [
+    "read-build-status",
+    "generate-version",
+    "create-or-reuse-task",
+    "wait-buildable-task",
+    "trigger-build",
+    "observe-build",
+    "confirm-build-platform-publish"
+  ];
+  for (const status of statuses) {
+    const found = ids.find((id) => commands[id]?.status === status);
+    if (found) return { id: found, ...commands[found] };
+  }
+  return null;
+}
+
+function buildDoneCommandSnapshot(record = {}) {
+  const commands = record.memento?.commands || {};
+  const ids = [
+    "confirm-build-platform-publish",
+    "observe-build",
+    "trigger-build",
+    "wait-buildable-task",
+    "create-or-reuse-task",
+    "generate-version",
+    "read-build-status"
+  ];
+  const found = ids.find((id) => commands[id]?.status === "done");
+  return found ? { id: found, ...commands[found] } : null;
+}
+
+function buildStatusFromCommand(record = {}) {
+  if (record.templateId === "release-existing") {
+    return {
+      status: "done",
+      label: "无需构建",
+      detail: "该 Run 只处理发布平台待发布记录。",
+      source: "Run 策略"
+    };
+  }
+
+  const active = buildCommandSnapshot(record, ["failed", "blocked", "running"]);
+  if (active) {
+    return {
+      status: active.status,
+      label: statusText(active.status),
+      detail: active.detail || active.phase || active.title || "构建阶段进行中",
+      source: "Run 阶段"
+    };
+  }
+
+  const done = buildDoneCommandSnapshot(record);
+  if (record.status === "done" || done?.id === "observe-build" || done?.id === "confirm-build-platform-publish") {
+    return {
+      status: "done",
+      label: "构建完成",
+      detail: done?.detail || "Run 已记录构建段完成。",
+      source: "Run 阶段"
+    };
+  }
+
+  if (record.status === "failed" || record.status === "blocked") {
+    return {
+      status: record.status,
+      label: statusText(record.status),
+      detail: record.phase || "Run 停在当前阶段。",
+      source: "Run 状态"
+    };
+  }
+
+  return {
+    status: "pending",
+    label: "待观察",
+    detail: "等待 Pipeline 进入构建观察。",
+    source: "Run 配置"
+  };
+}
+
+function serviceFallbackFromRunStage(fallback = {}, service = {}, services = []) {
+  if (fallback.status !== "failed") return fallback;
+  const detail = String(fallback.detail || "");
+  const serviceNames = serviceSignalNames(service);
+  const mentionedNames = services
+    .flatMap((item) => serviceSignalNames(item))
+    .filter((name) => name && detail.includes(name));
+  if (!mentionedNames.length) return fallback;
+  if (serviceNames.some((name) => detail.includes(name))) return fallback;
+  return {
+    ...fallback,
+    status: "blocked",
+    label: "未触发",
+    detail: `批量构建在 ${mentionedNames[0]} 失败后停止；平台未返回该服务的构建结果。`
+  };
+}
+
+function serviceBuildStatusItems(record = {}, signalOverrides = []) {
+  const normalized = normalizePipelineRunRecord(record);
+  const services = normalized.serviceSnapshot || [];
+  const target = normalized.target || {};
+  const storedSignals = Array.isArray(record.context?.data?.buildSignals)
+    ? record.context.data.buildSignals
+    : [];
+  const signals = [
+    ...signalOverrides,
+    ...storedSignals.filter((signal) => !signalOverrides.some((override) => String(override.service || "") === String(signal.service || "")))
+  ];
+  const baselines = normalized.context?.data?.buildBaseline || {};
+  const fallback = buildStatusFromCommand(normalized);
+
+  return services.map((service, index) => {
+    const serviceFallback = serviceFallbackFromRunStage(fallback, service, services);
+    const signal = buildSignalForDisplay(service, signals);
+    const baseline = directBuildBaselineForService(service, baselines);
+    const signalStatus = signal?.status === "succeeded" ? "done" : signal?.status;
+    const suppressLiveRunning = ["failed", "blocked"].includes(serviceFallback.status) && signalStatus === "running";
+    const suppressTerminalDowngrade = serviceFallback.status === "done" && signalStatus && signalStatus !== "done";
+    const effectiveSignal = suppressLiveRunning || suppressTerminalDowngrade ? null : signal;
+    const effectiveSignalStatus = effectiveSignal?.status === "succeeded" ? "done" : effectiveSignal?.status;
+    const status = effectiveSignalStatus || serviceFallback.status;
+    const candidateBuildIds = Array.isArray(effectiveSignal?.candidateBuildIds)
+      ? effectiveSignal.candidateBuildIds.filter(Boolean)
+      : [effectiveSignal?.candidateBuildId].filter(Boolean);
+    const buildId = effectiveSignal?.buildId || (!effectiveSignal || ["succeeded", "failed"].includes(effectiveSignal.status) ? service.buildId || "" : "");
+    const targetVersion = service.generatedVersion || service.imageVersion || effectiveSignal?.version || "-";
+    const structureDetail = signal?.structureDetail || service.structureDetail || service.detail?.structureDetail || null;
+    const statusLabel = effectiveSignal
+      ? effectiveSignal.status === "succeeded"
+        ? "构建成功"
+        : effectiveSignal.status === "failed"
+          ? "构建失败"
+          : "构建中"
+      : serviceFallback.label;
+    const item = {
+      key: serviceBuildStatusItemKey(service, index),
+      serviceIndex: index,
+      name: serviceDisplayName(service),
+      imageJenkinsName: service.imageJenkinsName || serviceDisplayName(service),
+      imageNameEn: service.imageNameEn || "",
+      serviceKey: service.serviceKey || "",
+      applicationCode: service.applicationCode || target.appCode || "-",
+      branch: service.codeBranch || target.branch || "-",
+      targetVersion,
+      status,
+      statusLabel,
+      source: effectiveSignal ? effectiveSignal.source || "观察轮询快照" : serviceFallback.source,
+      detail: effectiveSignal ? buildStatusReasonText(effectiveSignal.reason) : serviceFallback.detail,
+      reason: effectiveSignal?.reason || "",
+      buildId,
+      candidateBuildId: candidateBuildIds[0] || "",
+      candidateBuildIds,
+      observedAt: effectiveSignal?.at || 0,
+      baselineSuccess: baseline ? formatBuildMarker(baseline.lastSuccessId, baseline.lastSuccessTime) : "-",
+      baselineFailure: baseline ? formatBuildMarker(baseline.lastFailureId, baseline.lastFailureTime) : "-",
+      structureDetail
+    };
+    const structureStageRows = buildStageRowsFromStructureDetail(item.structureDetail, item);
+    return {
+      ...item,
+      structureStageRows,
+      structureStageSummary: buildStructureStageSummary(structureStageRows)
+    };
+  });
+}
+
+function aggregateBuildStatusFromItems(record = {}, items = serviceBuildStatusItems(record)) {
+  const commandStatus = buildStatusFromCommand(normalizePipelineRunRecord(record));
+  if (items.some((item) => item.status === "failed") || commandStatus.status === "failed") return "failed";
+  if (commandStatus.status === "blocked") return "blocked";
+  if (items.some((item) => item.status === "running") || commandStatus.status === "running") return "running";
+  if (record.status === "done" || (items.length > 0 && items.every((item) => item.status === "done"))) return "done";
+  return commandStatus.status || "pending";
+}
+
+function aggregateBuildStatus(record = {}) {
+  return aggregateBuildStatusFromItems(record, serviceBuildStatusItems(record));
+}
+
+function buildEvidenceSummaryFromItems(items = []) {
+  if (!items.length) return "暂无服务快照。";
+  return items.map((item) => {
+    const version = item.buildId || item.observedAt ? `构建 ${item.buildId || "-"} / ${item.targetVersion || "-"}` : item.targetVersion || "-";
+    return `${item.name}: ${item.statusLabel} / ${version}`;
+  }).join("；");
+}
+
+function buildEvidenceSummary(record = {}) {
+  return buildEvidenceSummaryFromItems(serviceBuildStatusItems(record));
+}
+
+function buildRunStageRows(record = {}) {
+  const aggregateStatus = aggregateBuildStatus(record);
+  const evidence = buildEvidenceSummary(record);
+
+  return [{
+    id: "build-log",
+    label: "Build Log",
+    name: "原始构建日志",
+    status: aggregateStatus || "pending",
+    detail: `${evidence}；阶段明细以平台原始 Jenkins 日志为准，未读取到日志前不推断具体阶段。`
+  }];
+}
+
+function buildRunStageRowsWithLog(record = {}, logResult = null) {
+  const parsedRows = buildStageRowsFromLogResult(logResult);
+  if (parsedRows.length) return parsedRows;
+  return buildRunStageRows(record);
+}
+
+function buildStageRowsFromLogResult(logResult = null) {
+  const logText = buildLogText(logResult);
+  if (!logText) return [];
+
+  const logOutcome = buildLogOutcome(logText);
+  const parsedStages = parseBuildLogStages(logText);
+  if (!parsedStages.length) return [];
+
+  return parsedStages.map((stage, index) => {
+    const known = buildStageDefinitionForLabel(stage.label, index);
+    const status = stage.status || (logOutcome === "done" ? "done" : "pending");
+    const detail = status === "running"
+      ? "原始构建日志显示当前停留在该阶段。"
+      : status === "done"
+        ? "原始构建日志显示该阶段已结束。"
+        : status === "failed"
+          ? "原始构建日志显示构建在该阶段失败或中断。"
+      : "原始构建日志尚未进入该阶段。";
+    return {
+      id: known.id || stage.id || `log-stage-${index + 1}`,
+      label: stage.label,
+      name: known.name || stage.label,
+      status,
+      detail
+    };
+  });
+}
+
+function structureStageDetailText(stage = {}) {
+  const duration = stage.durationMillis ? `，耗时 ${durationText(stage.durationMillis)}` : "";
+  if (stage.status === "running") return `平台阶段表显示当前停留在该阶段${duration}。`;
+  if (stage.status === "done") return `平台阶段表显示该阶段已结束${duration}。`;
+  if (stage.status === "failed") return `平台阶段表显示构建在该阶段失败或中断${duration}。`;
+  return "等待本次构建进入该阶段。";
+}
+
+function buildStageIdFromLabel(label = "", index = 0) {
+  const slug = normalizeBuildStageLabel(label)
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || `stage-${index + 1}`;
+}
+
+function buildStageDefinitionForLabel(label = "", index = 0) {
+  const normalized = normalizeBuildStageLabel(label);
+  const known = BUILD_DETAIL_STAGES.find((stage) => normalizeBuildStageLabel(stage.label) === normalized);
+  if (known) return known;
+  return {
+    id: buildStageIdFromLabel(label, index),
+    label,
+    name: BUILD_STAGE_NAME_BY_LABEL.get(normalized) || label || `Stage ${index + 1}`
+  };
+}
+
+function buildNumberText(value) {
+  const match = String(value || "").match(/#?\s*(\d+)/);
+  return match ? match[1] : "";
+}
+
+function structureStagesMatchBuildHint(stages = [], item = {}) {
+  const hints = [
+    item.buildId,
+    item.candidateBuildId,
+    ...(Array.isArray(item.candidateBuildIds) ? item.candidateBuildIds : [])
+  ].map(buildNumberText).filter(Boolean);
+  if (!hints.length) return false;
+  const hintSet = new Set(hints);
+  return stages.some((stage) => hintSet.has(buildNumberText(stage.buildId)));
+}
+
+function buildStageRowsFromStructureDetail(structureDetail = null, item = {}) {
+  const parsedStages = parseBuildStructureStages(structureDetail, {
+    buildId: item.buildId || item.candidateBuildId,
+    targetVersion: item.targetVersion && item.targetVersion !== "-" ? item.targetVersion : ""
+  });
+  if (!parsedStages.length) return [];
+  const matchedBuildHint = structureStagesMatchBuildHint(parsedStages, item);
+  if (item.status === "running" && parsedStages.every((stage) => stage.status === "done") && !matchedBuildHint) {
+    return [];
+  }
+  if (item.status === "failed" && parsedStages.every((stage) => stage.status === "done") && !matchedBuildHint) {
+    return [];
+  }
+
+  return parsedStages.map((stage, index) => {
+    const known = buildStageDefinitionForLabel(stage.label, index);
+    return {
+      id: known.id || stage.id || `structure-stage-${index + 1}`,
+      label: stage.label,
+      name: known.name || stage.label,
+      status: stage.status || "pending",
+      detail: structureStageDetailText(stage),
+      source: stage.source,
+      buildId: stage.buildId,
+      buildVersion: stage.buildVersion
+    };
+  });
+}
+
+function buildStructureStageSummary(rows = []) {
+  if (!rows.length) return "";
+  const failed = rows.find((stage) => stage.status === "failed");
+  if (failed) return `平台阶段表显示 ${failed.name || failed.label} 失败或中断`;
+  const running = rows.find((stage) => stage.status === "running");
+  if (running) return `平台阶段表显示 ${running.name || running.label} 运行中`;
+  const doneRows = rows.filter((stage) => stage.status === "done");
+  if (doneRows.length && doneRows.length === rows.length) return "平台阶段表显示构建完成";
+  const lastDone = doneRows[doneRows.length - 1];
+  if (lastDone) return `平台阶段表已完成到 ${lastDone.name || lastDone.label}`;
+  return "";
+}
+
+function buildLogStageSummary(rows = [], logResult = null) {
+  if (!buildLogText(logResult)) return "";
+  const failed = rows.find((stage) => stage.status === "failed");
+  if (failed) return `${failed.name || failed.label} 失败或中断`;
+  const running = rows.find((stage) => stage.status === "running");
+  if (running) return `${running.name || running.label} 运行中`;
+  const lastDone = [...rows].reverse().find((stage) => stage.status === "done");
+  if (lastDone && rows.every((stage) => stage.status === "done")) return "Jenkins 日志显示构建完成";
+  if (lastDone) return `已完成到 ${lastDone.name || lastDone.label}`;
+  return "";
+}
+
+function serviceMatchesLogRequest(item = {}, logRequest = null) {
+  if (!item || !logRequest) return false;
+  return [item.name, item.imageJenkinsName, item.imageNameEn]
+    .filter(Boolean)
+    .map(String)
+    .includes(String(logRequest.imageJenkinsName || ""));
+}
+
+function serviceBuildStageText(item = {}, options = {}) {
+  const { logState = {} } = options;
+  if (item.structureStageRows?.length) {
+    return item.structureStageSummary || "平台阶段表已读取";
+  }
+  if (logState.rows?.length || logState.result) {
+    const logStageSummary = buildLogStageSummary(logState.rows || [], logState.result);
+    if (logStageSummary) return logStageSummary;
+  }
+  if (item.buildId) return "已获得 Jenkins 构建号，可按需读取原始日志阶段";
+  if (item.candidateBuildIds?.length) return item.detail || "等待本次构建进入阶段";
+  if (item.status === "running") return item.detail || "等待构建平台回写服务状态";
+  return item.detail || "等待本次构建进入阶段";
+}
+
+function buildServiceStatusRequestForService(record = {}, service = {}, item = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  const target = normalized.target || {};
+  if (!service || !target.profileId || !target.accountId) return null;
+  const imageJenkinsName = service.imageJenkinsName || serviceDisplayName(service);
+  if (!imageJenkinsName) return null;
+  const candidateBuildIds = Array.isArray(item?.candidateBuildIds)
+    ? item.candidateBuildIds.filter(Boolean)
+    : [item?.candidateBuildId].filter(Boolean);
+  return {
+    profileId: target.profileId,
+    accountId: target.accountId,
+    customerNameEn: target.customerNameEn,
+    applicationCode: service.applicationCode || target.appCode,
+    codeBranch: service.codeBranch || target.branch,
+    imageJenkinsName,
+    imageVersion: service.generatedVersion || service.imageVersion || "",
+    ...(candidateBuildIds.length ? { candidateBuildIds } : {})
+  };
+}
+
+function buildLogRequestForRun(record = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  const target = normalized.target || {};
+  const items = serviceBuildStatusItems(normalized);
+  const item = items.find((entry) => entry.buildId || structureBuildIdForLog(entry)) || items.find((entry) => entry.candidateBuildIds?.length) || null;
+  if (!item) return null;
+  return buildLogRequestForServiceItem(normalized, item);
+}
+
+function buildIdFromStructureRecord(record = null) {
+  return record?.id || record?.name || record?.buildID || record?.buildId || "";
+}
+
+function structureBuildIdForLog(item = {}) {
+  const targetVersion = item.targetVersion && item.targetVersion !== "-" ? item.targetVersion : "";
+  if (!item.structureDetail || !targetVersion) return "";
+  const record = pickBuildStructureRecord(item.structureDetail, {
+    buildId: item.buildId,
+    targetVersion,
+    imageVersion: targetVersion
+  });
+  if (!record) return "";
+  if (record.imageVersion && String(record.imageVersion) !== String(targetVersion)) return "";
+  return buildIdFromStructureRecord(record);
+}
+
+function buildLogRequestForServiceItem(record = {}, item = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  const target = normalized.target || {};
+  const service = normalized.serviceSnapshot?.[item.serviceIndex] ||
+    normalized.serviceSnapshot?.find((entry) => serviceDisplayName(entry) === item?.name) ||
+    normalized.serviceSnapshot?.[0];
+  const expectedVersion = item.targetVersion && item.targetVersion !== "-" ? item.targetVersion : "";
+  const structureBuildId = structureBuildIdForLog(item);
+  const buildId = item?.buildId || structureBuildId;
+  const candidateBuildIds = buildId ? [] : item?.candidateBuildIds || [];
+  if ((!buildId && !candidateBuildIds.length && !expectedVersion) || !service || !target.profileId || !target.accountId) return null;
+  return {
+    profileId: target.profileId,
+    accountId: target.accountId,
+    customerNameEn: target.customerNameEn,
+    applicationCode: service.applicationCode || target.appCode,
+    codeBranch: service.codeBranch || target.branch,
+    imageJenkinsName: service.imageJenkinsName || item.name,
+    ...(buildId ? { buildId } : { candidateBuildIds }),
+    expectedVersion
+  };
+}
+
+function shouldApplySignalVersion(service = {}, signal = {}) {
+  if (!signal?.version) return false;
+  const hasTaskTargetVersion = Boolean(service.generatedVersion || service.imageVersion);
+  if (signal.reason === "waiting_for_target_version" && hasTaskTargetVersion) return false;
+  return true;
+}
+
+function applyBuildSignalsToServices(services = [], signals = []) {
+  return services.map((service) => {
+    const signal = buildSignalForDisplay(service, signals);
+    if (!signal) return service;
+    const applySignalVersion = shouldApplySignalVersion(service, signal);
+    return {
+      ...service,
+      ...(applySignalVersion ? {
+        generatedVersion: signal.version,
+        imageVersion: signal.version
+      } : {}),
+      buildId: signal.buildId || (signal.status === "running" ? "" : service.buildId)
+    };
+  });
 }
 
 function isProdEnv(env) {
@@ -202,7 +815,7 @@ function defaultBranchForReleaseEnv(profile, envId) {
 function workflowItems(profiles = []) {
   return profiles.flatMap((profile) =>
     (profile.accounts || []).map((account) => ({
-      id: `${profile.id}:${account.id}`,
+      id: workflowKey(profile.id, account.id),
       profileId: profile.id,
       accountId: account.id,
       label: `${profile.shortName} · ${account.label}`,
@@ -211,6 +824,173 @@ function workflowItems(profiles = []) {
       account
     }))
   );
+}
+
+function workflowKey(profileId, accountId) {
+  return profileId && accountId ? `${profileId}:${accountId}` : "";
+}
+
+function workflowKeyFromTarget(target = {}) {
+  return workflowKey(target.profileId, target.accountId);
+}
+
+function runWorkflowKey(record = {}) {
+  return workflowKeyFromTarget(record.target || record.context?.target || {});
+}
+
+function defaultWorkbenchState(profile = {}, preferredBranch = "mastertest") {
+  const releaseEnvId = defaultReleaseEnvId(profile, preferredBranch);
+  const branch = releaseEnvId ? defaultBranchForReleaseEnv(profile, releaseEnvId) : preferredBranch;
+  return {
+    appCode: profile?.applications?.[0]?.code || "emr",
+    branch,
+    buildStrategy: "prod",
+    releaseEnvId,
+    serviceSearch: "",
+    servicePage: 1,
+    servicePageSize: DEFAULT_SERVICE_PAGE_SIZE,
+    selectedKeys: []
+  };
+}
+
+function normalizeWorkbenchState(state = {}, profile = {}) {
+  const fallback = defaultWorkbenchState(profile, state.branch || "mastertest");
+  const nextBranch = state.branch || fallback.branch;
+  const appCode = profile?.applications?.some((item) => item.code === state.appCode)
+    ? state.appCode
+    : fallback.appCode;
+  const releaseEnvId = releaseRequired(nextBranch) && profile?.releaseEnvironments?.length
+    ? profile.releaseEnvironments.some((item) => item.id === state.releaseEnvId)
+      ? state.releaseEnvId
+      : defaultReleaseEnvId(profile, nextBranch)
+    : state.releaseEnvId || fallback.releaseEnvId;
+
+  return {
+    ...fallback,
+    ...state,
+    appCode,
+    branch: nextBranch,
+    buildStrategy: state.buildStrategy || fallback.buildStrategy,
+    releaseEnvId,
+    servicePage: Number(state.servicePage || fallback.servicePage),
+    servicePageSize: Number(state.servicePageSize || fallback.servicePageSize),
+    serviceSearch: String(state.serviceSearch || ""),
+    selectedKeys: Array.isArray(state.selectedKeys) ? state.selectedKeys : []
+  };
+}
+
+function sameWorkbenchState(left = {}, right = {}) {
+  return left.appCode === right.appCode &&
+    left.branch === right.branch &&
+    left.buildStrategy === right.buildStrategy &&
+    left.releaseEnvId === right.releaseEnvId &&
+    left.serviceSearch === right.serviceSearch &&
+    left.servicePage === right.servicePage &&
+    left.servicePageSize === right.servicePageSize &&
+    JSON.stringify(left.selectedKeys || []) === JSON.stringify(right.selectedKeys || []);
+}
+
+function defaultPipelineRunState() {
+  return {
+    schemaVersion: 2,
+    started: false,
+    templateId: "build-and-release",
+    status: "draft",
+    phase: "待选择",
+    activity: [],
+    releaseReason: DEFAULT_RELEASE_REASON,
+    releaseNotice: DEFAULT_RELEASE_NOTICE,
+    serviceSnapshot: [],
+    context: {
+      target: {},
+      inputs: {
+        releaseReason: DEFAULT_RELEASE_REASON,
+        releaseNotice: DEFAULT_RELEASE_NOTICE
+      },
+      data: {}
+    },
+    commands: [],
+    memento: {
+      cursor: { commandId: "", index: 0, status: "pending", phase: "待选择", detail: "" },
+      order: [],
+      commands: {}
+    }
+  };
+}
+
+function defaultRunDraftState(templateId = "build-and-release") {
+  return {
+    templateId,
+    releaseReason: DEFAULT_RELEASE_REASON,
+    releaseNotice: DEFAULT_RELEASE_NOTICE
+  };
+}
+
+function normalizeRunDraftState(state = {}) {
+  return {
+    ...defaultRunDraftState(state.templateId || "build-and-release"),
+    ...state
+  };
+}
+
+function resolveNextValue(valueOrUpdater, previous) {
+  return typeof valueOrUpdater === "function" ? valueOrUpdater(previous) : valueOrUpdater;
+}
+
+function findWorkflowTarget(target = {}, profiles = []) {
+  const targetProfile = profiles.find((item) => item.id === target.profileId);
+  if (!targetProfile) return { ok: false, reason: "missing_profile" };
+  const targetAccount = targetProfile.accounts?.find((item) => item.id === target.accountId) || targetProfile.accounts?.[0];
+  if (target.accountId && !targetProfile.accounts?.some((item) => item.id === target.accountId)) {
+    return { ok: false, reason: "missing_account", profile: targetProfile };
+  }
+  return { ok: true, profile: targetProfile, account: targetAccount };
+}
+
+function runUnavailableMessage(record = {}, profiles = []) {
+  const target = record.target || {};
+  const found = findWorkflowTarget(target, profiles);
+  if (found.ok) return "";
+  const workflow = [target.profileId, target.accountId].filter(Boolean).join(":") || "未知 workflow";
+  if (found.reason === "missing_account") return `Run 指向的账号已不存在：${workflow}`;
+  return `Run 指向的 workflow 已不存在：${workflow}`;
+}
+
+function resumableDetachedRunningRun(record = {}, currentRunId = "") {
+  const normalized = normalizePipelineRunRecord(record);
+  if (normalized.status !== "running" || normalized.id === currentRunId) return normalized;
+
+  const point = inferResumePoint(normalized);
+  const commandId = point.commandId;
+  const detail = point.detail || "该 Run 不是当前页面正在执行的任务，可从这里继续接管。";
+  const memento = {
+    ...(normalized.memento || {}),
+    cursor: {
+      ...(normalized.memento?.cursor || {}),
+      commandId,
+      status: "blocked",
+      phase: point.phase || normalized.phase || "等待处理",
+      detail
+    },
+    commands: {
+      ...(normalized.memento?.commands || {}),
+      ...(commandId ? {
+        [commandId]: {
+          ...(normalized.memento?.commands?.[commandId] || {}),
+          status: "blocked",
+          phase: point.phase || normalized.phase || "等待处理",
+          detail
+        }
+      } : {})
+    }
+  };
+
+  return normalizePipelineRunRecord({
+    ...normalized,
+    status: "blocked",
+    phase: point.phase || normalized.phase || "等待处理",
+    memento
+  });
 }
 
 function workflowCustomerKey(customer = {}) {
@@ -311,7 +1091,28 @@ function statusText(status) {
   return labels[status] || status || "-";
 }
 
+function compactStructureDetail(structureDetail = null) {
+  const avgRows = Array.isArray(structureDetail?.avg) ? structureDetail.avg : [];
+  const avg = avgRows
+    .map((row) => {
+      const stageName = String(row?.stageName || row?.name || row?.label || "").trim();
+      if (!stageName) return null;
+      const duration = Number(row?.duration ?? row?.durationMillis ?? 0);
+      return {
+        stageName,
+        ...(Number.isFinite(duration) && duration > 0 ? { duration } : {})
+      };
+    })
+    .filter(Boolean);
+  if (!avg.length) return null;
+  return {
+    ...(structureDetail?.code ? { code: structureDetail.code } : {}),
+    avg
+  };
+}
+
 function compactService(service) {
+  const structureDetail = compactStructureDetail(service.structureDetail || service.detail?.structureDetail);
   return {
     serviceKey: service.serviceKey,
     customerNameEn: service.customerNameEn,
@@ -322,7 +1123,8 @@ function compactService(service) {
     imageDeployId: service.imageDeployId,
     applicationCode: service.applicationCode,
     codeBranch: service.codeBranch,
-    coverageRun: service.coverageRun
+    coverageRun: service.coverageRun,
+    ...(structureDetail ? { structureDetail } : {})
   };
 }
 
@@ -376,40 +1178,19 @@ function App() {
   const [activeTab, setActiveTab] = useState("workbench");
   const [activeProfileId, setActiveProfileId] = useState("demob");
   const [activeAccountId, setActiveAccountId] = useState("demo_prod");
-  const [appCode, setAppCode] = useState("emr");
-  const [branch, setBranch] = useState("mastertest");
-  const [buildStrategy, setBuildStrategy] = useState("prod");
-  const [releaseEnvId, setReleaseEnvId] = useState("demob-uat-a");
-  const [serviceSearch, setServiceSearch] = useState("");
-  const [servicePage, setServicePage] = useState(1);
-  const [servicePageSize, setServicePageSize] = useState(DEFAULT_SERVICE_PAGE_SIZE);
-  const [selectedKeys, setSelectedKeys] = useState([]);
+  const [workflowStateById, setWorkflowStateById] = useState({});
   const [serviceMeta, setServiceMeta] = useState({});
   const [probes, setProbes] = useState({});
   const [credentialState, setCredentialState] = useState([]);
-  const [busy, setBusy] = useState("");
-  const [refreshing, setRefreshing] = useState(false);
-  const [lastResult, setLastResult] = useState(null);
-  const [run, setRun] = useState({
-    started: false,
-    templateId: "build-and-release",
-    status: "draft",
-    phase: "待选择",
-    activity: [],
-    outcomes: {},
-    releaseReason: DEFAULT_RELEASE_REASON,
-    releaseNotice: DEFAULT_RELEASE_NOTICE,
-    serviceSnapshot: []
-  });
-  const [runDraft, setRunDraft] = useState({
-    templateId: "build-and-release",
-    releaseReason: DEFAULT_RELEASE_REASON,
-    releaseNotice: DEFAULT_RELEASE_NOTICE
-  });
+  const [busyByWorkflowId, setBusyByWorkflowId] = useState({});
+  const [refreshingByWorkflowId, setRefreshingByWorkflowId] = useState({});
+  const [lastResultByWorkflowId, setLastResultByWorkflowId] = useState({});
+  const [runByWorkflowId, setRunByWorkflowId] = useState({});
+  const [runDraftByWorkflowId, setRunDraftByWorkflowId] = useState({});
   const [runHistory, setRunHistory] = useState([]);
   const [runHistoryLoaded, setRunHistoryLoaded] = useState(false);
   const [pendingRunAction, setPendingRunAction] = useState(null);
-  const [expandedRunIds, setExpandedRunIds] = useState([]);
+  const [expandedRunIdsByWorkflowId, setExpandedRunIdsByWorkflowId] = useState({});
   const autoRefreshKeys = useRef(new Set());
   const runHistorySaveTimer = useRef(null);
 
@@ -425,10 +1206,16 @@ function App() {
         setRunHistoryLoaded(true);
         const profile = data.profiles?.find((item) => item.id === activeProfileId) || data.profiles?.[0];
         if (profile) {
+          const accountId = profile.accounts?.[0]?.id || "";
+          const key = workflowKey(profile.id, accountId);
           setActiveProfileId(profile.id);
-          setActiveAccountId(profile.accounts?.[0]?.id || "");
-          setAppCode(profile.applications?.[0]?.code || "emr");
-          setReleaseEnvId(profile.releaseEnvironments?.[0]?.id || "");
+          setActiveAccountId(accountId);
+          if (key) {
+            setWorkflowStateById((current) => ({
+              ...current,
+              [key]: normalizeWorkbenchState(current[key], profile)
+            }));
+          }
         }
       })
       .catch((error) => {
@@ -442,7 +1229,33 @@ function App() {
   const profile = profiles.find((item) => item.id === activeProfileId) || profiles[0];
   const account = profile?.accounts?.find((item) => item.id === activeAccountId) || profile?.accounts?.[0];
   const workflowEntries = useMemo(() => workflowItems(profiles), [profiles]);
-  const activeWorkflowId = profile && account ? `${profile.id}:${account.id}` : "";
+  const activeWorkflowId = profile && account ? workflowKey(profile.id, account.id) : "";
+  const activeWorkflowState = useMemo(() => {
+    return normalizeWorkbenchState(workflowStateById[activeWorkflowId], profile);
+  }, [workflowStateById, activeWorkflowId, profile]);
+  const {
+    appCode,
+    branch,
+    buildStrategy,
+    releaseEnvId,
+    serviceSearch,
+    servicePage,
+    servicePageSize,
+    selectedKeys
+  } = activeWorkflowState;
+  const run = useMemo(() => {
+    return normalizePipelineRunRecord(runByWorkflowId[activeWorkflowId] || defaultPipelineRunState());
+  }, [runByWorkflowId, activeWorkflowId]);
+  const runDraft = useMemo(() => {
+    return normalizeRunDraftState(runDraftByWorkflowId[activeWorkflowId]);
+  }, [runDraftByWorkflowId, activeWorkflowId]);
+  const busy = activeWorkflowId ? busyByWorkflowId[activeWorkflowId] || "" : "";
+  const refreshing = activeWorkflowId ? Boolean(refreshingByWorkflowId[activeWorkflowId]) : false;
+  const lastResult = activeWorkflowId ? lastResultByWorkflowId[activeWorkflowId] || null : null;
+  const expandedRunIds = activeWorkflowId ? expandedRunIdsByWorkflowId[activeWorkflowId] || [] : [];
+  const visibleRunHistory = useMemo(() => {
+    return runHistory.filter((record) => runWorkflowKey(record) === activeWorkflowId);
+  }, [runHistory, activeWorkflowId]);
   const env = findReleaseEnv(profile, releaseEnvId);
   const probeKey = activeWorkflowId || profile?.id;
   const buildProbe = probes[probeKey]?.build;
@@ -491,6 +1304,10 @@ function App() {
       pageSize: servicePageSize
     });
   }, [branchDiscovery, serviceRows, servicePage, servicePageSize]);
+  const visibleServiceKeys = useMemo(() => {
+    if (!profile) return new Set();
+    return new Set(servicePageData.rows.map((row) => serviceKey(row, profile, appCode, branch)));
+  }, [servicePageData.rows, profile, appCode, branch]);
 
   function serviceFromRow(row) {
     if (!profile || !row) return null;
@@ -512,10 +1329,138 @@ function App() {
     return selectedKeys
       .map((key) => {
         const row = serviceRows.find((item) => serviceKey(item, profile, appCode, branch) === key) || serviceMeta[key];
-        return serviceFromRow(row);
-      })
+      return serviceFromRow(row);
+    })
       .filter(Boolean);
   }, [selectedKeys, serviceRows, profile, appCode, branch, serviceMeta]);
+  const hiddenSelectedServices = useMemo(() => {
+    return selectedServices.filter((service) => {
+      const key = service.serviceKey || serviceKey(service, profile, appCode, branch);
+      return !visibleServiceKeys.has(key);
+    });
+  }, [selectedServices, visibleServiceKeys, profile, appCode, branch]);
+
+  function patchWorkflowState(workflowId, stateProfile, patchOrUpdater) {
+    if (!workflowId || !stateProfile) return;
+    setWorkflowStateById((current) => {
+      const previous = normalizeWorkbenchState(current[workflowId], stateProfile);
+      const patch = resolveNextValue(patchOrUpdater, previous) || {};
+      const next = normalizeWorkbenchState({ ...previous, ...patch }, stateProfile);
+      if (sameWorkbenchState(previous, next)) return current;
+      return { ...current, [workflowId]: next };
+    });
+  }
+
+  function ensureWorkflowState(workflowId, stateProfile, patch = {}) {
+    if (!workflowId || !stateProfile) return;
+    setWorkflowStateById((current) => {
+      if (current[workflowId]) return current;
+      return {
+        ...current,
+        [workflowId]: normalizeWorkbenchState(patch, stateProfile)
+      };
+    });
+  }
+
+  function patchActiveWorkflowState(patchOrUpdater) {
+    patchWorkflowState(activeWorkflowId, profile, patchOrUpdater);
+  }
+
+  function setWorkbenchField(field, valueOrUpdater) {
+    patchActiveWorkflowState((previous) => ({
+      [field]: resolveNextValue(valueOrUpdater, previous[field])
+    }));
+  }
+
+  function setAppCode(valueOrUpdater) {
+    setWorkbenchField("appCode", valueOrUpdater);
+  }
+
+  function setBranch(valueOrUpdater) {
+    setWorkbenchField("branch", valueOrUpdater);
+  }
+
+  function setBuildStrategy(valueOrUpdater) {
+    setWorkbenchField("buildStrategy", valueOrUpdater);
+  }
+
+  function setReleaseEnvId(valueOrUpdater) {
+    setWorkbenchField("releaseEnvId", valueOrUpdater);
+  }
+
+  function setServiceSearch(valueOrUpdater) {
+    setWorkbenchField("serviceSearch", valueOrUpdater);
+  }
+
+  function setServicePage(valueOrUpdater) {
+    setWorkbenchField("servicePage", valueOrUpdater);
+  }
+
+  function setServicePageSize(valueOrUpdater) {
+    setWorkbenchField("servicePageSize", valueOrUpdater);
+  }
+
+  function setSelectedKeys(valueOrUpdater) {
+    setWorkbenchField("selectedKeys", valueOrUpdater);
+  }
+
+  function setBusy(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setBusyByWorkflowId((current) => ({
+      ...current,
+      [workflowId]: resolveNextValue(valueOrUpdater, current[workflowId] || "")
+    }));
+  }
+
+  function setRefreshing(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setRefreshingByWorkflowId((current) => ({
+      ...current,
+      [workflowId]: Boolean(resolveNextValue(valueOrUpdater, Boolean(current[workflowId])))
+    }));
+  }
+
+  function setLastResult(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setLastResultByWorkflowId((current) => ({
+      ...current,
+      [workflowId]: resolveNextValue(valueOrUpdater, current[workflowId] || null)
+    }));
+  }
+
+  function setRun(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setRunByWorkflowId((current) => {
+      const previous = normalizePipelineRunRecord(current[workflowId] || defaultPipelineRunState());
+      const rawNext = resolveNextValue(valueOrUpdater, previous);
+      const next = normalizePipelineRunRecord(options.touch === false ? rawNext : touchRunRecord(rawNext));
+      return { ...current, [workflowId]: next };
+    });
+  }
+
+  function setRunDraft(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setRunDraftByWorkflowId((current) => {
+      const previous = normalizeRunDraftState(current[workflowId]);
+      const next = normalizeRunDraftState(resolveNextValue(valueOrUpdater, previous));
+      return { ...current, [workflowId]: next };
+    });
+  }
+
+  function setExpandedRunIds(valueOrUpdater, options = {}) {
+    const workflowId = options.workflowId || activeWorkflowId;
+    if (!workflowId) return;
+    setExpandedRunIdsByWorkflowId((current) => {
+      const previous = current[workflowId] || [];
+      const next = resolveNextValue(valueOrUpdater, previous) || [];
+      return { ...current, [workflowId]: next };
+    });
+  }
 
   useEffect(() => {
     if (!bootstrap) return;
@@ -568,15 +1513,20 @@ function App() {
   }, [profile?.id, account?.id, appCode, branch]);
 
   useEffect(() => {
-    if (!run.id) return;
-    const terminal = run.status === "done" || run.status === "failed" || run.status === "blocked";
-    const record = normalizePipelineRunRecord({
-      ...run,
-      updatedAt: new Date().toISOString(),
-      completedAt: terminal ? run.completedAt || new Date().toISOString() : run.completedAt
-    });
-    setRunHistory((current) => upsertPipelineRunRecord(current, record));
-  }, [run]);
+    const records = Object.values(runByWorkflowId)
+      .filter((item) => item?.id)
+      .map((item) => {
+        const normalized = normalizePipelineRunRecord(item);
+        const terminal = normalized.status === "done" || normalized.status === "failed" || normalized.status === "cancelled";
+        return normalizePipelineRunRecord({
+          ...normalized,
+          updatedAt: new Date().toISOString(),
+          completedAt: terminal ? normalized.completedAt || new Date().toISOString() : normalized.completedAt
+        });
+      });
+    if (!records.length) return;
+    setRunHistory((current) => records.reduce((history, record) => upsertPipelineRunRecord(history, record), current));
+  }, [runByWorkflowId]);
 
   function buildRunTarget() {
     return {
@@ -638,29 +1588,102 @@ function App() {
   }
 
   function setRunPhase(phase, status = "running") {
-    setRun((current) => ({ ...current, phase, status }));
+    setRun((current) => ({
+      ...current,
+      phase,
+      status,
+      ...(["done", "failed", "cancelled"].includes(status) ? { completedAt: new Date().toISOString() } : {})
+    }));
   }
 
   function patchRun(patch) {
-    setRun((current) => ({ ...current, ...patch }));
-  }
-
-  function resetRunDraft(templateId = "build-and-release") {
-    setRunDraft({
-      templateId,
-      releaseReason: DEFAULT_RELEASE_REASON,
-      releaseNotice: DEFAULT_RELEASE_NOTICE
+    const { buildSnapshot, buildBaseline, buildSignals, buildApplySignal, ...runPatch } = patch;
+    const compactSignals = buildSignals !== undefined ? compactBuildSignals(buildSignals) : undefined;
+    setRun((current) => {
+      const serviceSnapshot = compactSignals
+        ? applyBuildSignalsToServices(runPatch.serviceSnapshot || current.serviceSnapshot || [], compactSignals)
+        : runPatch.serviceSnapshot || current.serviceSnapshot || [];
+      return normalizePipelineRunRecord({
+        ...current,
+        ...runPatch,
+        serviceSnapshot,
+        context: {
+          ...(current.context || {}),
+          ...(runPatch.context || {}),
+          data: {
+            ...(current.context?.data || {}),
+            ...(runPatch.context?.data || {}),
+            ...(buildSnapshot !== undefined ? { buildSnapshot } : {}),
+            ...(buildBaseline !== undefined ? { buildBaseline } : {}),
+            ...(compactSignals !== undefined ? { buildSignals: compactSignals } : {}),
+            ...(buildApplySignal !== undefined ? { buildApplySignal } : {})
+          }
+        }
+      });
     });
   }
 
-  function updateOutcome(id, status, detail) {
-    setRun((current) => ({
-      ...current,
-      outcomes: {
-        ...current.outcomes,
-        [id]: { status, detail, at: nowText() }
-      }
-    }));
+  function resetRunDraft(templateId = "build-and-release", options = {}) {
+    setRunDraft(defaultRunDraftState(templateId), options);
+  }
+
+  function commandIdForLegacyStep(id, status) {
+    const aliases = {
+      probe: "probe-platforms",
+      "build-status": "read-build-status",
+      version: "generate-version",
+      "create-task": "create-or-reuse-task",
+      "build-task": "wait-buildable-task",
+      build: "trigger-build",
+      "build-observe": "observe-build",
+      "build-apply-observe": "observe-build",
+      "build-platform-publish": "confirm-build-platform-publish",
+      "release-observe": "wait-release-record",
+      "release-detail": "read-release-detail",
+      release: status === "done" ? "complete-run" : "wait-release-record"
+    };
+    return aliases[id] || id;
+  }
+
+  function eventTypeForStatus(status) {
+    if (status === "done") return "done";
+    if (status === "blocked") return "block";
+    if (status === "failed") return "fail";
+    return "run";
+  }
+
+  function emitCommandEvent(id, status, detail) {
+    setRun((current) => {
+      const normalized = normalizePipelineRunRecord(current);
+      const commandId = commandIdForLegacyStep(id, status);
+      const command = normalized.commands.find((item) => item.id === commandId) || { id: commandId, title: commandId, phase: normalized.phase || "Pipeline" };
+      const eventType = eventTypeForStatus(status);
+      const display = command.display?.[eventType] || {};
+      const event = {
+        type: eventType,
+        status,
+        commandId,
+        title: display.title || command.title || commandId,
+        phase: display.phase || command.phase || normalized.phase || "Pipeline",
+        detail: detail || display.detail || "",
+        tone: status === "failed" ? "danger" : status === "blocked" ? "warning" : status === "done" ? "success" : "default",
+        at: nowText()
+      };
+      const memento = applyCommandEventToMemento(normalized.memento, event);
+      return normalizePipelineRunRecord({
+        ...normalized,
+        started: true,
+        status: status === "failed" || status === "blocked" ? status : normalized.status === "draft" ? "running" : normalized.status,
+        phase: event.phase,
+        memento,
+        activity: [{
+          at: event.at,
+          title: event.title,
+          detail: event.detail,
+          tone: event.tone
+        }, ...(normalized.activity || [])].slice(0, 120)
+      });
+    });
   }
 
   function applyBootstrapPayload(payload) {
@@ -675,18 +1698,21 @@ function App() {
   function setProfileContext(nextProfileId, nextAccountId) {
     const next = profiles.find((item) => item.id === nextProfileId);
     if (!next) return;
-    setActiveProfileId(next.id);
     const nextAccount = next.accounts?.find((item) => item.id === nextAccountId) || next.accounts?.[0];
+    const nextWorkflowId = workflowKey(next.id, nextAccount?.id || "");
+    setActiveProfileId(next.id);
     setActiveAccountId(nextAccount?.id || "");
-    setAppCode(next.applications?.[0]?.code || "emr");
     const nextReleaseEnvId = defaultReleaseEnvId(next, "mastertest");
-    setReleaseEnvId(nextReleaseEnvId);
     const nextBranch = defaultBranchForReleaseEnv(next, nextReleaseEnvId);
-    setBranch(nextBranch);
-    setBuildStrategy("prod");
-    setSelectedKeys([]);
-    setServiceSearch("");
-    resetRunDraft();
+    ensureWorkflowState(nextWorkflowId, next, {
+      appCode: next.applications?.[0]?.code || "emr",
+      branch: nextBranch,
+      buildStrategy: "prod",
+      releaseEnvId: nextReleaseEnvId,
+      serviceSearch: "",
+      servicePage: 1,
+      selectedKeys: []
+    });
   }
 
   function activateWorkflow(item) {
@@ -696,14 +1722,19 @@ function App() {
 
   function applyRunTarget(target = {}) {
     const nextProfile = profiles.find((item) => item.id === target.profileId);
+    if (!nextProfile) return;
+    const nextAccountId = target.accountId || nextProfile.accounts?.[0]?.id || "";
+    const nextWorkflowId = workflowKey(nextProfile.id, nextAccountId);
     if (nextProfile) {
       setActiveProfileId(nextProfile.id);
-      setActiveAccountId(target.accountId || nextProfile.accounts?.[0]?.id || "");
+      setActiveAccountId(nextAccountId);
     }
-    if (target.appCode) setAppCode(target.appCode);
-    if (target.branch) setBranch(target.branch);
-    setBuildStrategy(target.buildStrategy || "prod");
-    if (target.releaseEnvId) setReleaseEnvId(target.releaseEnvId);
+    patchWorkflowState(nextWorkflowId, nextProfile, {
+      ...(target.appCode ? { appCode: target.appCode } : {}),
+      ...(target.branch ? { branch: target.branch } : {}),
+      buildStrategy: target.buildStrategy || "prod",
+      ...(target.releaseEnvId ? { releaseEnvId: target.releaseEnvId } : {})
+    });
   }
 
   function syncReleaseEnvForBuildBranch(nextBranch) {
@@ -742,18 +1773,26 @@ function App() {
 
   function loadRunDraft(record, options = {}) {
     const normalized = normalizePipelineRunRecord(record);
+    const unavailable = runUnavailableMessage(normalized, profiles);
+    if (unavailable) {
+      setLastResult({ tone: "warning", title: "Pipeline 未启动", detail: unavailable });
+      return;
+    }
     const draft = clonePipelineRunDraft(normalized);
+    const targetWorkflowId = workflowKeyFromTarget(draft.target);
     applyRunTarget(draft.target);
-    setSelectedKeys(keysFromRunServices(draft.serviceSnapshot, draft.target));
-    setServiceSearch(draft.serviceSnapshot[0]?.imageJenkinsName || "");
+    patchWorkflowState(targetWorkflowId, profiles.find((item) => item.id === draft.target.profileId), {
+      selectedKeys: keysFromRunServices(draft.serviceSnapshot, draft.target),
+      serviceSearch: draft.serviceSnapshot[0]?.imageJenkinsName || ""
+    });
     setRunDraft({
       templateId: draft.templateId,
       releaseReason: draft.releaseReason,
       releaseNotice: draft.releaseNotice
-    });
-    setLastResult({ tone: "success", title: "Pipeline 已复制", detail: "已恢复客户、环境、服务组和发布入参。" });
+    }, { workflowId: targetWorkflowId });
+    setLastResult({ tone: "success", title: "Pipeline 已复制", detail: "已恢复客户、环境、服务组和发布入参。" }, { workflowId: targetWorkflowId });
     if (options.action) {
-      setPendingRunAction({ action: options.action, record: normalized });
+      setPendingRunAction({ action: options.action, record: normalized, workflowId: targetWorkflowId });
     }
   }
 
@@ -765,9 +1804,11 @@ function App() {
   }
 
   async function clearRunHistoryRecords() {
-    const preserved = run.id && run.status === "running"
-      ? runHistory.filter((record) => record.id === run.id)
-      : [];
+    const activeRunIds = new Set(visibleRunHistory.map((record) => record.id));
+    const preserved = runHistory.filter((record) => {
+      if (!activeRunIds.has(record.id)) return true;
+      return run.id && run.status === "running" && record.id === run.id;
+    });
     setRunHistory(preserved);
     setExpandedRunIds((current) => current.filter((id) => preserved.some((record) => record.id === id)));
     try {
@@ -778,7 +1819,9 @@ function App() {
       setLastResult({
         tone: "success",
         title: "Run 历史已清理",
-        detail: preserved.length ? "已清空历史，并保留当前运行中的 Pipeline Run。" : "Pipeline Run 历史已清空。"
+        detail: run.id && run.status === "running"
+          ? "已清空当前 workflow 历史，并保留当前运行中的 Pipeline Run。"
+          : "当前 workflow 的 Pipeline Run 历史已清空。"
       });
     } catch (error) {
       setLastResult({ tone: "warning", title: "Run 历史清理失败", detail: error.message });
@@ -791,6 +1834,7 @@ function App() {
 
   useEffect(() => {
     if (!pendingRunAction || !profile) return;
+    if (pendingRunAction.workflowId && pendingRunAction.workflowId !== activeWorkflowId) return;
     const record = pendingRunAction.record;
     if (!runTargetMatches(record.target)) return;
     const services = hydrateServiceSnapshot(record.serviceSnapshot, record.target);
@@ -809,7 +1853,7 @@ function App() {
         copiedFromRunId: record.id
       });
     }
-  }, [pendingRunAction, activeProfileId, activeAccountId, appCode, branch, buildStrategy, releaseEnvId, profile?.id, serviceMeta]);
+  }, [pendingRunAction, activeWorkflowId, activeProfileId, activeAccountId, appCode, branch, buildStrategy, releaseEnvId, profile?.id, serviceMeta]);
 
   function replaceProbe(profileId, accountId, kind, result) {
     const key = accountId ? `${profileId}:${accountId}` : profileId;
@@ -856,6 +1900,7 @@ function App() {
         delayMs: overrides.retryDelayMs || READ_RETRY_DELAY_MS,
         onRetry: overrides.onRetry
       });
+      applyBootstrapPayload(json);
       const result = json.result || json;
       const currentProbeKey = `${targetProfile.id}:${targetAccount.id}`;
       const keptPrevious = Boolean(probes[currentProbeKey]?.[kind]);
@@ -934,6 +1979,24 @@ function App() {
     setSelectedKeys((current) => removeSelectedServiceKey(current, key));
   }
 
+  function removeHiddenSelectedServices() {
+    const hiddenKeys = new Set(hiddenSelectedServices.map((service) => service.serviceKey).filter(Boolean));
+    if (!hiddenKeys.size) return;
+    setSelectedKeys((current) => current.filter((key) => !hiddenKeys.has(key)));
+  }
+
+  function startSelectedPipeline(templateId) {
+    if (hiddenSelectedServices.length) {
+      setLastResult({
+        tone: "warning",
+        title: "Pipeline 未启动",
+        detail: `当前选择包含不在当前服务页/过滤结果里的隐藏服务：${selectedServicesText(hiddenSelectedServices)}。请先移除隐藏选择，或刷新/切换过滤条件后只保留本次要启动的服务。`
+      });
+      return;
+    }
+    startPipeline(templateId, selectedServices);
+  }
+
   function releaseOnlyServiceSnapshot() {
     return {
       serviceKey: `${profile?.id || "profile"}::${appCode}::${env?.showNameEn || "release"}::release-existing`,
@@ -985,7 +2048,7 @@ function buildImagesFor(services) {
       const release = await runProbe("release", { silentBusy: true });
       if (!release?.ok) return { ok: false, error: "release_probe_failed", message: summarizeFailure(release) };
     }
-    updateOutcome("probe", "done", releaseNeeded ? "build+release ready" : "build ready");
+    emitCommandEvent("probe", "done", releaseNeeded ? "build+release ready" : "build ready");
     return { ok: true };
   }
 
@@ -1015,14 +2078,21 @@ function buildImagesFor(services) {
       if (!result.ok) {
         const message = `${service.imageJenkinsName}: ${summarizeFailure(result)}`;
         if (options.logErrors !== false) addActivity("构建状态读取失败", message, "danger");
-        if (options.updateOnFailure !== false) updateOutcome("build-status", "failed", message);
+        if (options.updateOnFailure !== false) emitCommandEvent("build-status", "failed", message);
         return { ok: false, error: "build_status_failed", message };
       }
       nextMeta[service.serviceKey] = { detail: result };
-      updated.push({ ...service, detail: result });
+      const currentImageVersion = Array.isArray(result.detail)
+        ? result.detail.find((row) => row?.imageVersion)?.imageVersion
+        : "";
+      updated.push({
+        ...service,
+        detail: result,
+        ...(currentImageVersion ? { imageVersion: currentImageVersion } : {})
+      });
     }
     mergeServiceMeta(nextMeta);
-    if (options.updateOnSuccess !== false) updateOutcome("build-status", "done", "service detail loaded");
+    if (options.updateOnSuccess !== false) emitCommandEvent("build-status", "done", "service detail loaded");
     if (logActivity) {
       addActivity("构建状态读取完成", updated.map((service) => `${service.imageJenkinsName}: ${service.detail?.detail?.length || 0} 条`).join(" / "), "success");
     }
@@ -1045,7 +2115,7 @@ function buildImagesFor(services) {
     if (!result.ok) {
       const message = summarizeFailure(result);
       addActivity("版本预检失败", message, "danger");
-      updateOutcome("version", "failed", message);
+      emitCommandEvent("version", "failed", message);
       return { ok: false, error: "version_failed", message };
     }
     const versions = result.probe?.versions || {};
@@ -1056,7 +2126,7 @@ function buildImagesFor(services) {
       return { ...service, generatedVersion };
     });
     mergeServiceMeta(nextMeta);
-    updateOutcome("version", "done", "versions generated");
+    emitCommandEvent("version", "done", "versions generated");
     addActivity("版本预检完成", updated.map((service) => `${service.imageNameEn || service.imageJenkinsName}: ${service.generatedVersion || "未返回"}`).join(" / "), "success");
     return { ok: true, services: updated };
   }
@@ -1098,7 +2168,7 @@ function buildImagesFor(services) {
         item.imageJenkinsName === service.imageJenkinsName || item.imageNameEn === service.imageNameEn
       );
       if (match?.imageVersion) nextMeta[service.serviceKey] = { generatedVersion: match.imageVersion };
-      return match?.imageVersion ? { ...service, generatedVersion: match.imageVersion } : service;
+      return match?.imageVersion ? { ...service, generatedVersion: match.imageVersion, imageVersion: match.imageVersion } : service;
     });
     if (Object.keys(nextMeta).length) mergeServiceMeta(nextMeta);
     return updated;
@@ -1125,11 +2195,11 @@ function buildImagesFor(services) {
           `任务 ${taskIdOf(existing.snapshot.task) || "-"} 刚才返回已有新版本构建，重新新建当前 Pipeline 任务。`,
           "warning"
         );
-        updateOutcome("create-task", "running", "stale task skipped");
+        emitCommandEvent("create-task", "running", "stale task skipped");
       } else if (existing.snapshot.allBuildable) {
         const updated = syncVersionsFromTaskImages(services, existing.snapshot.images);
         addActivity("复用已有构建任务", `${selectedServicesText(services)} 与任务 ${taskIdOf(existing.snapshot.task) || "-"} 服务组完全一致，跳过重复创建。`, "success");
-        updateOutcome("create-task", "done", "reused existing task");
+        emitCommandEvent("create-task", "done", "reused existing task");
         return { ok: true, services: updated, reused: true, snapshot: existing.snapshot };
       } else if (existing.snapshot.allMatched) {
         const blocked = existing.snapshot.blockedImages?.map((item) => `${item.imageJenkinsName || item.imageNameEn || "unknown"}: ${buildPowerLabel(item.buildPower)}`).join(" / ");
@@ -1138,7 +2208,7 @@ function buildImagesFor(services) {
           `任务 ${taskIdOf(existing.snapshot.task) || "-"} 服务组完全一致，但 ${blocked || "未全部开放构建"}；不复用历史不可构建任务，继续为当前 Pipeline 新建任务。`,
           "warning"
         );
-        updateOutcome("create-task", "running", "服务组一致但未开放构建，继续新建当前 Pipeline 任务。");
+        emitCommandEvent("create-task", "running", "服务组一致但未开放构建，继续新建当前 Pipeline 任务。");
       } else {
         const mismatch = serviceGroupMismatchText(existing.snapshot, services);
         addActivity(
@@ -1146,7 +2216,7 @@ function buildImagesFor(services) {
           `最新待处理任务 ${taskIdOf(existing.snapshot.task) || "-"} 的服务组与当前选择不一致：${mismatch}。这只表示不能复用旧任务，继续为当前 Pipeline 新建任务。`,
           "warning"
         );
-        updateOutcome("create-task", "running", "已有任务不可复用，继续新建当前 Pipeline 任务。");
+        emitCommandEvent("create-task", "running", "已有任务不可复用，继续新建当前 Pipeline 任务。");
       }
     }
 
@@ -1183,7 +2253,7 @@ function buildImagesFor(services) {
         if (duplicateExisting.ok && duplicateExisting.snapshot.allBuildable && !duplicateExisting.snapshot.publishStage && !isExcludedTask(duplicateExisting.snapshot.task)) {
           const updated = syncVersionsFromTaskImages(services, duplicateExisting.snapshot.images);
           addActivity("复用已有构建任务", `平台拒绝重复创建后，已定位服务组完全一致的任务 ${taskIdOf(duplicateExisting.snapshot.task) || "-"}，跳过重复创建。`, "success");
-          updateOutcome("create-task", "done", "reused existing task after duplicate build info");
+          emitCommandEvent("create-task", "done", "reused existing task after duplicate build info");
           return { ok: true, services: updated, reused: true, snapshot: duplicateExisting.snapshot };
         }
         const duplicateBlockReason = duplicateExisting.ok && duplicateExisting.snapshot.publishStage
@@ -1197,11 +2267,11 @@ function buildImagesFor(services) {
           ? `平台提示已有构建信息，但未定位到可复用的当前服务任务：${duplicateBlockReason || serviceGroupMismatchText(duplicateExisting.snapshot, services)}。`
           : `平台提示已有构建信息，但复用定位失败：${duplicateExisting.message || summarizeFailure(duplicateExisting)}。`;
         addActivity("已有构建信息定位失败", recoverMessage, "danger");
-        updateOutcome("create-task", "failed", recoverMessage);
+        emitCommandEvent("create-task", "failed", recoverMessage);
         return { ok: false, error: "duplicate_build_info_not_recoverable", message: recoverMessage };
       }
       addActivity("构建任务创建失败", message, "danger");
-      updateOutcome("create-task", "failed", message);
+      emitCommandEvent("create-task", "failed", message);
       return { ok: false, error: "create_task_failed", message };
     }
 
@@ -1225,7 +2295,7 @@ function buildImagesFor(services) {
           images: result.images || []
         }]
       }, updated, { preferMatchedTask: true });
-      updateOutcome("create-task", "done", "recovered duplicate apply");
+      emitCommandEvent("create-task", "done", "recovered duplicate apply");
       addActivity(
         "构建申请编辑恢复完成",
         `已将已有申请 ${taskIdOf(result.task) || result.duplicateRecovery?.applyId || "-"} 编辑为当前服务组：${selectedServicesText(updated)}。`,
@@ -1233,7 +2303,7 @@ function buildImagesFor(services) {
       );
       return { ok: true, services: updated, created: true, recovered: true, snapshot };
     }
-    updateOutcome("create-task", "done", "created");
+    emitCommandEvent("create-task", "done", "created");
     addActivity("构建任务创建完成", result.reused ? "已复用已有任务。" : "构建平台已接受任务创建请求。", "success");
     return { ok: true, services: updated, created: true };
   }
@@ -1252,7 +2322,7 @@ function buildImagesFor(services) {
       if (!probe.snapshot.allMatched && !options.expectCreatedTask) {
         const message = `已有任务不可复用：${serviceGroupMismatchText(probe.snapshot, services)}。`;
         addActivity("构建任务不可复用", message, "warning");
-        updateOutcome("build-task", "blocked", message);
+        emitCommandEvent("build-task", "blocked", message);
         return { ok: false, error: "task_group_mismatch", message, blocked: true };
       }
       if (probe.snapshot.allBuildable && isExcludedSnapshot(probe.snapshot)) {
@@ -1261,13 +2331,13 @@ function buildImagesFor(services) {
           `任务 ${taskIdOf(probe.snapshot.task) || "-"} 刚才返回已有新版本构建，继续等待新任务服务行。`,
           "warning"
         );
-        updateOutcome("build-task", "running", "stale task skipped while waiting buildable task");
+        emitCommandEvent("build-task", "running", "stale task skipped while waiting buildable task");
         await new Promise((resolve) => setTimeout(resolve, options.expectCreatedTask ? 2000 : 1500));
         continue;
       }
       if (probe.snapshot.allBuildable) {
         addActivity("任务内构建已就绪", `任务 ${taskIdOf(probe.snapshot.task) || "-"} / ${selectedServicesText(services)} 均已开放构建。`, "success");
-        updateOutcome("build-task", "done", "all services buildable");
+        emitCommandEvent("build-task", "done", "all services buildable");
         return probe;
       }
       const blocked = probe.snapshot.blockedImages?.map((item) => `${item.imageJenkinsName || item.imageNameEn || "unknown"}: ${buildPowerLabel(item.buildPower)}`).join(" / ");
@@ -1285,7 +2355,7 @@ function buildImagesFor(services) {
       ? `最新构建任务服务组与当前选择不一致：${mismatch}。`
       : "已有构建任务已定位，但当前服务组还没有全部开放构建；可能任务仍在生成服务行，或平台尚未开放任务内构建。";
     addActivity("任务内构建阻塞", message, "warning");
-    updateOutcome("build-task", "blocked", message);
+    emitCommandEvent("build-task", "blocked", message);
     return { ok: false, error: "task_build_not_ready", message, blocked: true };
   }
 
@@ -1323,9 +2393,16 @@ function buildImagesFor(services) {
     const result = json.result || json;
     if (!result.ok) {
       const message = summarizeFailure(result);
+      if (direct && isBuildAlreadyRunningResult(result)) {
+        const error = "direct_build_already_running";
+        const blockedMessage = `${message}；开发环境不接入已有构建，当前 Pipeline 已暂停，稍后点击继续会重新预检。`;
+        addActivity("开发构建已暂停", blockedMessage, "warning");
+        emitCommandEvent("build", "blocked", blockedMessage);
+        return { ok: false, blocked: true, error, message: blockedMessage };
+      }
       if (shouldRestartBuildTaskAfterBuildTriggerFailure(result)) {
         addActivity("构建任务版本已过期", `${message}；重新进入构建任务定位，能复用则复用，否则新建当前 Pipeline 任务。`, "warning");
-        updateOutcome("build-task", "running", "stale build snapshot; reselect task");
+        emitCommandEvent("build-task", "running", "stale build snapshot; reselect task");
         return {
           ok: false,
           error: "build_snapshot_stale",
@@ -1336,7 +2413,7 @@ function buildImagesFor(services) {
       }
       if (shouldObserveAfterBuildTriggerFailure(result)) {
         addActivity("构建触发待确认", `${message}；构建平台可能已接受请求或服务已在构建中，进入构建观察。`, "warning");
-        updateOutcome("build", "running", "trigger uncertain; observing build status");
+        emitCommandEvent("build", "running", "trigger uncertain; observing build status");
         return {
           ok: true,
           uncertain: true,
@@ -1345,10 +2422,10 @@ function buildImagesFor(services) {
         };
       }
       addActivity("构建触发失败", message, "danger");
-      updateOutcome("build", "failed", message);
+      emitCommandEvent("build", "failed", message);
       return { ok: false, error: "build_failed", message };
     }
-    updateOutcome("build", "running", "build triggered");
+    emitCommandEvent("build", "running", "build triggered");
     addActivity("构建已触发", `${selectedServicesText(services)} 已调用构建平台，平台业务码 ${result.response?.businessCode || "未知"}。`, "success");
     return { ok: true, result };
   }
@@ -1420,11 +2497,11 @@ function buildImagesFor(services) {
     if (!result.ok) {
       const message = summarizeFailure(result);
       addActivity(`构建平台${label}失败`, message, "danger");
-      updateOutcome("build-platform-publish", "failed", message);
+      emitCommandEvent("build-platform-publish", "failed", message);
       return { ok: false, error: "build_platform_publish_failed", message };
     }
     addActivity(`构建平台${label}完成`, `apply=${applyId} 已提交，继续等待发布平台记录。`, "success");
-    updateOutcome("build-platform-publish", "done", label);
+    emitCommandEvent("build-platform-publish", "done", label);
     return { ok: true, result };
   }
 
@@ -1448,7 +2525,7 @@ function buildImagesFor(services) {
     const result = json.result || json;
     if (!result.ok) return { ok: false, error: "release_detail_failed", message: summarizeFailure(result) };
     addActivity("发布清单读取完成", `${appCode} ${app.applicationVersion} / ${env.showNameEn}/${env.environmentFlag}`, "success");
-    updateOutcome("release-detail", "done", "release detail loaded");
+    emitCommandEvent("release-detail", "done", "release detail loaded");
     return { ok: true, result };
   }
 
@@ -1459,7 +2536,7 @@ function buildImagesFor(services) {
     if (!app || pendingCount === 0) {
       const message = `${label}没有可发布服务，可能已被合并发布或其他 Pipeline 处理。`;
       addActivity(`${label}无需处理`, message, "success");
-      updateOutcome(`publish-${stage}`, "done", "no publishable services");
+      emitCommandEvent(`publish-${stage}`, "done", "no publishable services");
       return { ok: true, skipped: true, reason: "no_publishable_services" };
     }
     addActivity(label, `${profile.shortName} / ${appCode} ${app.applicationVersion} / ${env.showNameEn}/${env.environmentFlag}`);
@@ -1480,12 +2557,12 @@ function buildImagesFor(services) {
       const message = summarizeFailure(result);
       const blocked = Boolean(result.blocked || isRetryableProbeResult(result) || /^publish_.*(timeout|unavailable|failed)$/i.test(String(result.reason || "")));
       addActivity(`${label}${blocked ? "暂停" : "失败"}`, message, blocked ? "warning" : "danger");
-      updateOutcome(`publish-${stage}`, blocked ? "blocked" : "failed", message);
+      emitCommandEvent(`publish-${stage}`, blocked ? "blocked" : "failed", message);
       return { ok: false, blocked, error: blocked ? "publish_blocked" : "publish_failed", message };
     }
     const rateText = result.publishRate?.results?.map((item) => `${item.payload?.applicationCode || appCode} ${item.signal?.value ?? "100"}%`).join(" / ");
     addActivity(`${label}完成`, `${appCode} ${app.applicationVersion} 已提交发布平台并确认完成${rateText ? `：${rateText}` : ""}。`, "success");
-    updateOutcome(`publish-${stage}`, "done", "publish confirmed");
+    emitCommandEvent(`publish-${stage}`, "done", "publish confirmed");
     return { ok: true, result };
   }
 
@@ -1493,6 +2570,7 @@ function buildImagesFor(services) {
     const intervalMs = options.intervalMs || PIPELINE_OBSERVER_INTERVAL_MS;
     const buildTimeoutMs = options.buildTimeoutMs || PIPELINE_BUILD_OBSERVER_TIMEOUT_MS;
     const buildSnapshot = options.buildSnapshot || null;
+    const buildBaseline = options.buildBaseline || null;
     const confirmedBuildPublishes = new Set();
     const buildStartedAt = Date.now();
 
@@ -1510,7 +2588,7 @@ function buildImagesFor(services) {
       if (!status.ok) {
         const message = `第 ${attempt} 次读取构建状态失败：${status.message || summarizeFailure(status)}。将在构建观察预算内继续重试。`;
         addActivity("观察构建进度", message, "warning");
-        updateOutcome("build-observe", buildElapsedMs >= buildTimeoutMs ? "blocked" : "running", message);
+        emitCommandEvent("build-observe", buildElapsedMs >= buildTimeoutMs ? "blocked" : "running", message);
         if (buildElapsedMs >= buildTimeoutMs) {
           return {
             ok: false,
@@ -1523,7 +2601,10 @@ function buildImagesFor(services) {
         continue;
       }
 
-      const buildSignals = status.services.map((service) => buildSignalForService(service, service.detail));
+      const buildSignals = status.services.map((service) => ({
+        ...buildSignalForService(service, service.detail, { baseline: directBuildBaselineForService(service, buildBaseline) }),
+        structureDetail: service.detail?.structureDetail || null
+      }));
       let applySignal = null;
       if (buildSnapshot && branch !== "develop") {
         const applyProbe = await probeBuildApplyFor(services, buildSnapshot, {
@@ -1536,16 +2617,17 @@ function buildImagesFor(services) {
           if (isRetryableProbeResult(applyProbe) && buildElapsedMs < buildTimeoutMs) {
             const retryMessage = `第 ${attempt} 次读取构建任务状态失败：${message}。将在构建观察预算内继续重试。`;
             addActivity("构建任务状态读取暂不可用", retryMessage, "warning");
-            updateOutcome("build-apply-observe", "running", retryMessage);
+            emitCommandEvent("build-apply-observe", "running", retryMessage);
             await sleep(intervalMs);
             continue;
           }
           addActivity("构建任务状态读取失败", message, "danger");
-          updateOutcome("build-apply-observe", "failed", message);
+          emitCommandEvent("build-apply-observe", "failed", message);
           return { ok: false, error: "build_apply_probe_failed", message };
         }
         applySignal = buildApplySignal(applyProbe.task);
       }
+      patchRun({ buildSignals, buildApplySignal: applySignal });
 
       const failedBuild = buildSignals.find((item) => item.status === "failed");
       const failedApply = applySignal?.status === "failed" ? applySignal : null;
@@ -1555,8 +2637,8 @@ function buildImagesFor(services) {
           : `构建任务 ${failedApply.taskId || "-"} 状态失败（${failedApply.reason}）`;
         const message = `${failedText}，Pipeline 停在构建阶段，可修复后重试。`;
         addActivity("构建失败", message, "danger");
-        updateOutcome("build", "failed", message);
-        updateOutcome("build-observe", "failed", message);
+        emitCommandEvent("build", "failed", message);
+        emitCommandEvent("build-observe", "failed", message);
         return { ok: false, error: "build_failed", message };
       }
 
@@ -1573,8 +2655,8 @@ function buildImagesFor(services) {
       if (publishProgress.status === "failed") {
         const message = `构建任务 ${publishProgress.applySignal?.taskId || applyTaskId || "-"} 状态失败（${publishProgress.reason}），Pipeline 停在构建阶段，可修复后重试。`;
         addActivity("构建失败", message, "danger");
-        updateOutcome("build", "failed", message);
-        updateOutcome("build-observe", "failed", message);
+        emitCommandEvent("build", "failed", message);
+        emitCommandEvent("build-observe", "failed", message);
         return { ok: false, error: "build_failed", message };
       }
       if (publishProgress.status === "confirm") {
@@ -1585,13 +2667,13 @@ function buildImagesFor(services) {
         }, services);
         if (!confirmed.ok) return confirmed;
         confirmedBuildPublishes.add(`${applyTaskId || applySignal?.taskId}:${publishProgress.environment}`);
-        updateOutcome("build-platform-publish", "running", `${buildPlatformPublishEnvironmentsFor(branch).length - publishProgress.missingEnvironments.length + 1}/${buildPlatformPublishEnvironmentsFor(branch).length}`);
+        emitCommandEvent("build-platform-publish", "running", `${buildPlatformPublishEnvironmentsFor(branch).length - publishProgress.missingEnvironments.length + 1}/${buildPlatformPublishEnvironmentsFor(branch).length}`);
         await sleep(1000);
         continue;
       }
       if (requiredBuildPublishEnvironments.length && publishProgress.status === "complete") {
         const label = requiredBuildPublishEnvironments.map(buildPublishEnvironmentLabel).join(" + ");
-        updateOutcome("build-platform-publish", "done", label);
+        emitCommandEvent("build-platform-publish", "done", label);
       }
       const decisionApplySignal = requiredBuildPublishEnvironments.length && publishProgress.status === "complete"
         ? buildPlatformPublishSubmittedSignal(applySignal || {}, applyTaskId)
@@ -1615,7 +2697,7 @@ function buildImagesFor(services) {
           : "";
         const message = `第 ${attempt} 次，已等待 ${durationText(buildElapsedMs)} / 上限 ${durationText(buildTimeoutMs)}，构建仍在进行：${waiting || selectedServicesText(services)}${applyText}。`;
         addActivity("观察构建进度", message, "default");
-        updateOutcome("build-observe", "running", message);
+        emitCommandEvent("build-observe", "running", message);
         await sleep(intervalMs);
         continue;
       }
@@ -1625,7 +2707,7 @@ function buildImagesFor(services) {
           ? `已观察构建任务 ${durationText(buildElapsedMs)}，超过上限 ${durationText(buildTimeoutMs)}，仍未确认发布按钮可用；Pipeline 暂停，可从当前阶段重试。`
           : `已观察构建 ${durationText(buildElapsedMs)}，超过上限 ${durationText(buildTimeoutMs)}，仍未确认成功；Pipeline 暂停，可从当前阶段重试。`;
         addActivity("构建观察超时", message, "warning");
-        updateOutcome("build-observe", "blocked", message);
+        emitCommandEvent("build-observe", "blocked", message);
         return {
           ok: false,
           error: decision.reason,
@@ -1634,8 +2716,8 @@ function buildImagesFor(services) {
         };
       }
 
-      updateOutcome("build", "done", "build completed");
-      updateOutcome("build-observe", "done", "build succeeded");
+      emitCommandEvent("build", "done", "build completed");
+      emitCommandEvent("build-observe", "done", "build succeeded");
       return { ok: true };
     }
   }
@@ -1670,7 +2752,7 @@ function buildImagesFor(services) {
       if (!release?.ok) {
         const message = `第 ${releaseAttempt} 次，发布记录已等待 ${durationText(releaseElapsedMs)} / 上限 ${durationText(releaseTimeoutMs)}，发布总览暂未拿到 ${appCode} 可发布应用：${summarizeFailure(release)}。`;
         addActivity("观察发布记录", message, "warning");
-        updateOutcome("release-observe", "running", message);
+        emitCommandEvent("release-observe", "running", message);
         if (releaseElapsedMs >= releaseTimeoutMs) {
           return {
             ok: false,
@@ -1699,14 +2781,14 @@ function buildImagesFor(services) {
 
       if (releaseDecision.status === "ready") {
         addActivity("发布记录已出现", `${appCode} 待发布服务 ${releaseSignal.pendingCount} 个，继续执行 ${releasePlanText(branch)}。`, "success");
-        updateOutcome("release-observe", "done", "release record ready");
+        emitCommandEvent("release-observe", "done", "release record ready");
         return { ok: true, release, app: latestApp };
       }
       if (releaseDecision.status === "noop" && shouldNoopReleaseRecord({ releaseSignal, releaseNoWait, elapsedMs: releaseElapsedMs, noopAfterMs: releaseNoopAfterMs })) {
         const doneMessage = `${appCode} 在发布平台已无待发布服务，可能已被合并发布或其他 Pipeline 处理，发布段按无需处理结束。`;
         addActivity("发布记录无需处理", doneMessage, "success");
-        updateOutcome("release-observe", "done", "no publishable release record");
-        updateOutcome("release", "done", "no publishable release record");
+        emitCommandEvent("release-observe", "done", "no publishable release record");
+        emitCommandEvent("release", "done", "no publishable release record");
         return {
           ok: true,
           release,
@@ -1720,7 +2802,7 @@ function buildImagesFor(services) {
         : `已等待 ${durationText(releaseElapsedMs)} / 上限 ${durationText(releaseTimeoutMs)}`;
       const message = `第 ${releaseAttempt} 次，发布记录${waitBudgetText}，发布平台还没有 ${appCode} 待发布记录。`;
       addActivity("观察发布记录", message, "warning");
-      updateOutcome("release-observe", releaseDecision.status === "blocked" ? "blocked" : "running", message);
+      emitCommandEvent("release-observe", releaseDecision.status === "blocked" ? "blocked" : "running", message);
       if (releaseDecision.status === "blocked") {
         return {
           ok: false,
@@ -1745,7 +2827,7 @@ function buildImagesFor(services) {
     const releaseStages = releaseStagesFor(branch);
     if (!releaseStages.length) {
       addActivity("发布策略完成", "develop 环境无需进入发布平台，构建完成即视为复合 Pipeline 的发布段完成。", "success");
-      updateOutcome("release", "done", "skipped");
+      emitCommandEvent("release", "done", "skipped");
       return { ok: true, skipped: true };
     }
     setRunPhase("发布");
@@ -1759,7 +2841,7 @@ function buildImagesFor(services) {
     if (observed && !observed.ok) return observed;
     if (observed?.noPublishable) {
       addActivity("发布段完成", "发布平台已无待发布服务，本次 Pipeline 不再重复发布。", "success");
-      updateOutcome("release", "done", "no publishable services");
+      emitCommandEvent("release", "done", "no publishable services");
       return { ok: true, skipped: true, reason: "no_publishable_services" };
     }
     const release = observed?.release || await runProbe("release", { silentBusy: true, fast: false });
@@ -1767,10 +2849,10 @@ function buildImagesFor(services) {
     const app = observed?.app || pickReleaseApp(release);
     if (!releaseStages.includes("company")) {
       addActivity("公司发布跳过", `${branch} 环境策略为 ${releasePlanText(branch)}。`, "success");
-      updateOutcome("publish-company", "done", "skipped by policy");
+      emitCommandEvent("publish-company", "done", "skipped by policy");
     }
     releaseStages.forEach((stage) => {
-      updateOutcome(`publish-${stage}`, "running", `${releaseStageLabel(stage)} pending`);
+      emitCommandEvent(`publish-${stage}`, "running", `${releaseStageLabel(stage)} pending`);
     });
     let currentRelease = release;
     let currentApp = app;
@@ -1785,7 +2867,7 @@ function buildImagesFor(services) {
       const published = await publishFor(stage, currentApp, detail.result);
       if (!published.ok) return published;
     }
-    updateOutcome("release", "done", `${releasePlanText(branch)} published`);
+    emitCommandEvent("release", "done", `${releasePlanText(branch)} published`);
     return { ok: true, stages: releaseStages };
   }
 
@@ -1807,35 +2889,67 @@ function buildImagesFor(services) {
       detail: `${selectedServicesText(services)} / ${appCode} / ${branch} / ${env?.showNameEn || "-"}${copiedText}`,
       tone: "default"
     }, ...(options.priorActivity || [])].slice(0, 120);
-    setExpandedRunIds((current) => Array.from(new Set([...current, runId])));
-    setRun({
-      id: runId,
-      createdAt,
-      completedAt: "",
-      started: true,
+    const target = buildRunTarget();
+    setBusy(`pipeline-${templateId}`);
+    let initialServices = services;
+    let initialBuildStatus = null;
+    if (templateId !== "release-existing") {
+      try {
+        const status = await readBuildStatusFor(services, {
+          quiet: true,
+          logErrors: false,
+          updateOnFailure: false,
+          updateOnSuccess: false,
+          retryAttempts: 1
+        });
+        if (status.ok) {
+          initialBuildStatus = status;
+          initialServices = status.services;
+        }
+      } catch {
+        initialBuildStatus = null;
+      }
+    }
+    const serviceSnapshot = initialServices.map(compactService);
+    const runRecord = buildPipelineRun({
       templateId,
+      target,
+      services: serviceSnapshot,
+      inputs: { releaseReason: reason, releaseNotice: notice },
+      id: runId,
+      now: createdAt
+    });
+    setExpandedRunIds((current) => Array.from(new Set([...current, runId])));
+    setRun(normalizePipelineRunRecord({
+      ...runRecord,
+      copiedFromRunId: options.copiedFromRunId || "",
+      started: true,
       status: "running",
       phase: "准备",
-      target: buildRunTarget(),
       releaseReason: reason,
       releaseNotice: notice,
-      outcomes: {},
-      serviceSnapshot: services.map(compactService),
-      buildSnapshot: null,
+      context: {
+        ...runRecord.context,
+        data: {
+          ...(runRecord.context?.data || {}),
+          buildSnapshot: null,
+          buildBaseline: null
+        }
+      },
       activity: initialActivity
-    });
+    }));
     setSelectedKeys([]);
     resetRunDraft();
-    setBusy(`pipeline-${templateId}`);
     try {
       const ready = await ensurePlatformReady(templateId);
       if (!ready.ok) throw new Error(ready.message || ready.error);
 
-      let workingServices = services;
+      let workingServices = initialServices;
       let buildSnapshot = null;
+      let buildBaseline = null;
       if (templateId !== "release-existing") {
         setRunPhase("构建预检");
-        const status = await readBuildStatusFor(workingServices, {
+        const status = initialBuildStatus || await readBuildStatusFor(workingServices, {
           quiet: true,
           logErrors: false,
           updateOnFailure: false,
@@ -1843,10 +2957,24 @@ function buildImagesFor(services) {
         });
         if (status.ok) {
           workingServices = status.services;
-          patchRun({ serviceSnapshot: workingServices.map(compactService) });
+          if (branch === "develop") {
+            buildBaseline = directBuildBaselineForServices(workingServices);
+            patchRun({ buildBaseline, serviceSnapshot: workingServices.map(compactService) });
+          } else {
+            patchRun({ serviceSnapshot: workingServices.map(compactService) });
+          }
         } else {
-          addActivity("构建状态预读跳过", `${status.message || status.error}；继续创建/复用构建任务，后续观察阶段会继续读取。`, "warning");
-          updateOutcome("build-status", "running", "预读失败，继续 Pipeline");
+          if (branch === "develop") {
+            const message = `${status.message || status.error}；开发环境直构建需要先确认服务是否可触发构建，当前 Pipeline 已暂停，稍后点击继续会重新预检。`;
+            addActivity("开发构建预检暂停", message, "warning");
+            emitCommandEvent("build-status", "blocked", message);
+            setRunPhase("构建预检", "blocked");
+            setLastResult({ tone: "warning", title: "Pipeline 已暂停", detail: message });
+            return;
+          } else {
+            addActivity("构建状态预读跳过", `${status.message || status.error}；继续创建/复用构建任务，后续观察阶段会继续读取。`, "warning");
+            emitCommandEvent("build-status", "running", "预读失败，继续 Pipeline");
+          }
         }
 
         const version = await generateVersionFor(workingServices);
@@ -1869,7 +2997,14 @@ function buildImagesFor(services) {
 
         if (branch === "develop") {
           const direct = await executeBuildFor(workingServices);
-          if (!direct.ok) throw new Error(direct.message || direct.error);
+          if (!direct.ok) {
+            if (direct.blocked) {
+              setRunPhase("等待构建完成", "blocked");
+              setLastResult({ tone: "warning", title: "Pipeline 已暂停", detail: direct.message });
+              return;
+            }
+            throw new Error(direct.message || direct.error);
+          }
         } else {
           const buildable = task.snapshot?.allBuildable
             ? task
@@ -1880,8 +3015,9 @@ function buildImagesFor(services) {
             return;
           }
           buildSnapshot = buildable.snapshot;
+          workingServices = syncVersionsFromTaskImages(workingServices, buildSnapshot.images);
           patchRun({ buildSnapshot, serviceSnapshot: workingServices.map(compactService) });
-          const build = await executeBuildFor(workingServices, buildable.snapshot);
+          const build = await executeBuildFor(workingServices, buildSnapshot);
           if (!build.ok) {
             if (build.staleBuildSnapshot && !options.restartedAfterStaleSnapshot) {
               const excludeTaskIds = [
@@ -1912,7 +3048,7 @@ function buildImagesFor(services) {
       }
 
       if (templateId !== "release-existing" && (templateId === "build-only" || branch === "develop")) {
-        const observedBuild = await observeBuildCompletion(workingServices, { buildSnapshot });
+        const observedBuild = await observeBuildCompletion(workingServices, { buildSnapshot, buildBaseline });
         if (!observedBuild.ok) {
           if (observedBuild.blocked) {
             setRunPhase("等待构建完成", "blocked");
@@ -1955,18 +3091,24 @@ function buildImagesFor(services) {
   async function resumePipeline(record, explicitServices = []) {
     const normalized = normalizePipelineRunRecord(record);
     const services = explicitServices.length ? explicitServices : hydrateServiceSnapshot(normalized.serviceSnapshot, normalized.target);
+    const startServices = (normalized.status === "draft" || normalized.started === false)
+      ? hydrateServiceSnapshot(clonePipelineRunDraft(normalized).serviceSnapshot, normalized.target)
+      : services;
     if (!canResumePipelineRun(normalized)) {
       setLastResult({ tone: "warning", title: "Run 不需要恢复", detail: "该 Pipeline Run 已完成或没有可恢复的失败/阻塞阶段。" });
       return;
     }
-    if (!services.length) {
+    if (!startServices.length) {
       setLastResult({ tone: "warning", title: "Run 无法恢复", detail: "历史 Run 缺少服务快照。" });
       return;
     }
 
-    const resumeStage = inferResumeStage(normalized);
-    if (resumeStage === "start" || resumeStage === "prepare") {
-      await startPipeline(normalized.templateId, services, {
+    const resumePoint = inferResumePoint(normalized);
+    const resumeCommandStage = resumePoint.stage;
+    const savedBuildSnapshot = normalized.context?.data?.buildSnapshot || null;
+    const savedBuildBaseline = normalized.context?.data?.buildBaseline || null;
+    if (!resumePoint.commandId || resumeCommandStage === "start" || resumeCommandStage === "prepare") {
+      await startPipeline(normalized.templateId, startServices, {
         runId: normalized.id,
         createdAt: normalized.createdAt,
         releaseReason: normalized.releaseReason,
@@ -1975,8 +3117,9 @@ function buildImagesFor(services) {
       });
       return;
     }
-    if (resumeStage === "build" && !normalized.buildSnapshot) {
-      await startPipeline(normalized.templateId, services, {
+    const resumeDevelopBuildObservation = normalized.target?.branch === "develop" && resumePoint.commandId === "observe-build" && savedBuildBaseline;
+    if (resumeCommandStage === "build" && !savedBuildSnapshot && !resumeDevelopBuildObservation) {
+      await startPipeline(normalized.templateId, startServices, {
         runId: normalized.id,
         createdAt: normalized.createdAt,
         releaseReason: normalized.releaseReason,
@@ -1989,12 +3132,12 @@ function buildImagesFor(services) {
     setRun({
       ...normalized,
       status: "running",
-      phase: `恢复${resumeStage === "release" ? "发布" : "构建"}`,
+      phase: `恢复${resumeCommandStage === "release" ? "发布" : "构建"}`,
       serviceSnapshot: services.map(compactService),
       activity: [{
         at: nowText(),
         title: "Pipeline 恢复",
-        detail: `从 ${resumeStage === "release" ? "发布观察/发布" : "构建"} 阶段继续，不重放已完成阶段。`,
+        detail: `从 ${resumeCommandStage === "release" ? "发布观察/发布" : "构建"} 阶段继续，不重放已完成阶段。`,
         tone: "default"
       }, ...(normalized.activity || [])].slice(0, 120)
     });
@@ -2002,42 +3145,60 @@ function buildImagesFor(services) {
     setBusy(`resume-${normalized.id}`);
     try {
       let result = null;
-      if (resumeStage === "build") {
-        const build = await executeBuildFor(services, normalized.buildSnapshot);
-        if (!build.ok && build.staleBuildSnapshot) {
-          const excludeTaskIds = staleTaskIdsFromBuildResult(build, normalized.buildSnapshot);
-          await startPipeline(normalized.templateId, services, {
-            runId: normalized.id,
-            createdAt: normalized.createdAt,
-            releaseReason: normalized.releaseReason,
-            releaseNotice: normalized.releaseNotice,
-            excludeTaskIds,
-            restartedAfterStaleSnapshot: true,
-            releaseNoWait: true,
-            priorActivity: [{
-              at: nowText(),
-              title: "Pipeline 重新定位",
-              detail: "旧构建任务返回已有新版本构建，重新进入任务定位：能复用则复用，否则新建任务。",
-              tone: "warning"
-            }, ...(normalized.activity || [])]
-          });
-          return;
+      if (resumeCommandStage === "build") {
+        if (resumePoint.commandId === "observe-build") {
+          result = await observeBuildCompletion(services, { buildSnapshot: savedBuildSnapshot, buildBaseline: savedBuildBaseline });
+          if (result.ok && normalized.templateId !== "build-only") {
+            result = await executeReleaseFlow(services, {
+              observeBuild: false,
+              buildSnapshot: savedBuildSnapshot,
+              releaseNoWait: true
+            });
+          }
+        } else {
+          const build = await executeBuildFor(services, savedBuildSnapshot);
+          if (!build.ok && build.staleBuildSnapshot) {
+            const excludeTaskIds = staleTaskIdsFromBuildResult(build, savedBuildSnapshot);
+            await startPipeline(normalized.templateId, services, {
+              runId: normalized.id,
+              createdAt: normalized.createdAt,
+              releaseReason: normalized.releaseReason,
+              releaseNotice: normalized.releaseNotice,
+              excludeTaskIds,
+              restartedAfterStaleSnapshot: true,
+              releaseNoWait: true,
+              priorActivity: [{
+                at: nowText(),
+                title: "Pipeline 重新定位",
+                detail: "旧构建任务返回已有新版本构建，重新进入任务定位：能复用则复用，否则新建任务。",
+                tone: "warning"
+              }, ...(normalized.activity || [])]
+            });
+            return;
+          }
+          if (!build.ok) {
+            if (build.blocked) {
+              setRunPhase("等待构建完成", "blocked");
+              setLastResult({ tone: "warning", title: "Pipeline 已暂停", detail: build.message });
+              return;
+            }
+            throw new Error(build.message || build.error);
+          }
+          if (normalized.templateId !== "build-only") {
+            result = await executeReleaseFlow(services, {
+              observeBuild: normalized.templateId !== "release-existing",
+              buildSnapshot: savedBuildSnapshot,
+              releaseNoWait: true
+            });
+          }
         }
-        if (!build.ok) throw new Error(build.message || build.error);
-        if (normalized.templateId !== "build-only") {
-          result = await executeReleaseFlow(services, {
-            observeBuild: normalized.templateId !== "release-existing",
-            buildSnapshot: normalized.buildSnapshot,
-            releaseNoWait: true
-          });
-        }
-      } else if (resumeStage === "release") {
+      } else if (resumeCommandStage === "release") {
         if (normalized.templateId === "build-only") {
           result = { ok: true, skipped: true };
         } else {
           result = await executeReleaseFlow(services, {
             observeBuild: normalized.templateId !== "release-existing",
-            buildSnapshot: normalized.buildSnapshot,
+            buildSnapshot: savedBuildSnapshot,
             releaseNoWait: true
           });
         }
@@ -2072,7 +3233,7 @@ function buildImagesFor(services) {
     const result = await probeBuildTasksFor(selectedServices, { ignoreVersion: true, maxTaskImageLookups: 1 });
     if (!result.ok) {
       addActivity("构建任务读取失败", result.message, "danger");
-      updateOutcome("build-task", "failed", result.message);
+      emitCommandEvent("build-task", "failed", result.message);
       return;
     }
     const snapshot = result.snapshot;
@@ -2086,7 +3247,7 @@ function buildImagesFor(services) {
       taskMessage,
       snapshot.allMatched ? "success" : "warning"
     );
-    updateOutcome("build-task", "done", taskMessage);
+    emitCommandEvent("build-task", "done", taskMessage);
   };
 
   const releaseNeeded = releaseRequired(branch);
@@ -2213,11 +3374,13 @@ function buildImagesFor(services) {
                   {selectedServices.length > 0 && (
                     <PipelineActionBar
                       services={selectedServices}
+                      hiddenServices={hiddenSelectedServices}
                       flow={flow}
                       running={running}
                       onRemove={removeSelectedService}
+                      onRemoveHidden={removeHiddenSelectedServices}
                       onClear={() => setSelectedKeys([])}
-                      onStart={(templateId) => startPipeline(templateId, selectedServices)}
+                      onStart={startSelectedPipeline}
                     />
                   )}
 
@@ -2322,7 +3485,7 @@ function buildImagesFor(services) {
             )}
 
             <PipelineRunTable
-              runs={runHistory}
+              runs={visibleRunHistory}
               historyLimit={bootstrap?.pipelineRunHistoryLimit || PIPELINE_RUN_HISTORY_LIMIT}
               currentRunId={run.id}
               running={running}
@@ -2331,6 +3494,8 @@ function buildImagesFor(services) {
               onCopy={copyRunRecord}
               onClearHistory={clearRunHistoryRecords}
               onResume={(record) => loadRunDraft(record, { action: "resume" })}
+              profiles={profiles}
+              activeWorkflowId={activeWorkflowId}
             />
 
           </TabsContent>
@@ -2501,15 +3666,16 @@ function BandItem({ label, value }) {
 
 function CurrentRunStatus({ run }) {
   const events = run.activity || [];
-  const important = events.find((item) => item.tone === "danger" || item.tone === "warning") || events[0];
-  const blockedOutcome = Object.values(run.outcomes || {}).find((item) => item.status === "blocked" || item.status === "failed");
-  const tone = run.status === "failed" || blockedOutcome?.status === "failed" ? "danger" : run.status === "blocked" || blockedOutcome?.status === "blocked" || important?.tone === "warning" ? "warning" : important?.tone || "default";
-  const title = blockedOutcome
+  const terminalSuccess = run.status === "done";
+  const important = terminalSuccess ? events[0] : events.find((item) => item.tone === "danger" || item.tone === "warning") || events[0];
+  const attentionCommand = terminalSuccess ? null : Object.values(run.memento?.commands || {}).find((item) => item.status === "failed" || item.status === "blocked" || item.status === "running");
+  const tone = run.status === "failed" || attentionCommand?.status === "failed" ? "danger" : run.status === "blocked" || attentionCommand?.status === "blocked" || important?.tone === "warning" ? "warning" : important?.tone || "default";
+  const title = attentionCommand
     ? run.status === "failed" ? "当前失败点" : "当前阻塞点"
     : important
       ? "最近 Run 事件"
       : "等待启动";
-  const rawDetail = blockedOutcome?.detail || important?.detail || "选择服务后点击 Pipeline 按钮，Run 会在这里显示当前状态和最近日志。";
+  const rawDetail = attentionCommand?.detail || important?.detail || "选择服务后点击 Pipeline 按钮，Run 会在这里显示当前状态和最近日志。";
   const detail = summarizeFailure(rawDetail);
   const recent = events.slice(0, 3);
   return (
@@ -2545,7 +3711,7 @@ function formatRunTime(value) {
   return date.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-function PipelineRunTable({ runs, historyLimit = PIPELINE_RUN_HISTORY_LIMIT, currentRunId, running, expandedRunIds = [], onView, onCopy, onClearHistory, onResume }) {
+function PipelineRunTable({ runs, historyLimit = PIPELINE_RUN_HISTORY_LIMIT, currentRunId, running, expandedRunIds = [], onView, onCopy, onClearHistory, onResume, profiles = [] }) {
   const [runPage, setRunPage] = useState(1);
   const [runPageSize, setRunPageSize] = useState(DEFAULT_RUN_PAGE_SIZE);
   const pageData = useMemo(() => paginateRows(runs, runPage, runPageSize), [runs, runPage, runPageSize]);
@@ -2582,7 +3748,7 @@ function PipelineRunTable({ runs, historyLimit = PIPELINE_RUN_HISTORY_LIMIT, cur
             </div>
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">
-              <div className="grid grid-cols-[120px_minmax(160px,1fr)_minmax(180px,1.3fr)_108px_minmax(116px,auto)] gap-3 border-b border-border bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
+              <div className="hidden md:grid md:grid-cols-[120px_minmax(160px,1fr)_minmax(180px,1.3fr)_108px_minmax(116px,auto)] gap-3 border-b border-border bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
                 <div>时间</div>
                 <div>Pipeline</div>
                 <div>目标/服务组</div>
@@ -2590,46 +3756,59 @@ function PipelineRunTable({ runs, historyLimit = PIPELINE_RUN_HISTORY_LIMIT, cur
                 <div className="text-right">操作</div>
               </div>
               <div className="divide-y divide-border">
-	                {pageData.rows.map((record) => {
-	                  const definition = pipelineById(record.templateId);
-	                  const target = record.target || {};
-	                  const targetText = `${target.appCode || "-"} / ${target.branch || "-"}${target.releaseEnvLabel ? ` / ${target.releaseEnvLabel}` : ""}`;
-	                  const servicesText = selectedServicesText(record.serviceSnapshot || []);
-	                  const resumable = canResumePipelineRun(record);
-	                  const isCurrent = record.id === currentRunId;
-	                  const expanded = expandedRunIds.includes(record.id);
-	                  return (
-	                    <React.Fragment key={record.id}>
-	                      <div className={cn("grid grid-cols-[120px_minmax(160px,1fr)_minmax(180px,1.3fr)_108px_minmax(116px,auto)] gap-3 px-3 py-3 text-sm", isCurrent && "bg-cyan-50/70")}>
-	                        <div className="text-xs text-muted-foreground">{formatRunTime(record.updatedAt || record.createdAt)}</div>
-	                        <div className="min-w-0">
-	                          <div className="break-words font-semibold">{definition.label}</div>
-	                          <div className="break-words text-xs text-muted-foreground">Run {record.id}</div>
-	                        </div>
-	                        <div className="min-w-0">
-	                          <div className="break-words font-medium">{targetText}</div>
-	                          <div className="break-words text-xs text-muted-foreground">{servicesText || "-"}</div>
-	                        </div>
-	                        <div className="flex flex-col items-center justify-center gap-1 text-center">
-	                          <Badge variant={statusVariant(record.status)}>{statusText(record.status)}</Badge>
-	                          <span className="max-w-full truncate text-xs text-muted-foreground">{statusText(record.phase || inferResumeStage(record))}</span>
-	                        </div>
-	                        <div className="flex flex-wrap justify-end gap-2">
-	                          <Button variant="outline" size="sm" onClick={() => onView(record)}>{expanded ? "收起" : "查看"}</Button>
-	                          <Button variant="secondary" size="sm" onClick={() => onCopy(record)}>
-	                            <Copy className="mr-1 h-3.5 w-3.5" />
-	                            复制
-	                          </Button>
-	                          <Button variant="default" size="sm" onClick={() => onResume(record)} disabled={running || record.status === "running" || !resumable}>
-	                            <RotateCcw className="mr-1 h-3.5 w-3.5" />
-	                            继续
-	                          </Button>
-	                        </div>
-	                      </div>
-	                      {expanded && <PipelineRunDetailPanel record={record} />}
-	                    </React.Fragment>
-	                  );
-	                })}
+                {pageData.rows.map((record) => {
+                  const isCurrent = record.id === currentRunId;
+                  const displayRecord = resumableDetachedRunningRun(record, currentRunId);
+                  const definition = pipelineById(displayRecord.templateId);
+                  const target = displayRecord.target || {};
+                  const targetText = `${target.appCode || "-"} / ${target.branch || "-"}${target.releaseEnvLabel ? ` / ${target.releaseEnvLabel}` : ""}`;
+                  const servicesText = selectedServicesText(displayRecord.serviceSnapshot || []);
+                  const unavailable = runUnavailableMessage(displayRecord, profiles);
+                  const resumable = !unavailable && canResumePipelineRun(displayRecord);
+                  const expanded = expandedRunIds.includes(displayRecord.id);
+                  const continueDisabled = running || (isCurrent && displayRecord.status === "running") || !resumable;
+                  return (
+                    <React.Fragment key={displayRecord.id}>
+                      <div className={cn("grid gap-3 px-3 py-3 text-sm md:grid-cols-[120px_minmax(160px,1fr)_minmax(180px,1.3fr)_108px_minmax(116px,auto)]", isCurrent && "bg-cyan-50/70")}>
+                        <div className="min-w-0 text-xs text-muted-foreground">
+                          <span className="mb-1 block font-semibold text-foreground md:hidden">时间</span>
+                          {formatRunTime(displayRecord.updatedAt || displayRecord.createdAt)}
+                        </div>
+                        <div className="min-w-0">
+                          <span className="mb-1 block text-xs font-semibold text-muted-foreground md:hidden">Pipeline</span>
+                          <div className="break-words font-semibold">{definition.label}</div>
+                          <div className="break-words text-xs text-muted-foreground">Run {displayRecord.id}</div>
+                        </div>
+                        <div className="min-w-0">
+                          <span className="mb-1 block text-xs font-semibold text-muted-foreground md:hidden">目标/服务组</span>
+                          <div className="break-words font-medium">{targetText}</div>
+                          <div className="break-words text-xs text-muted-foreground">{servicesText || "-"}</div>
+                            {unavailable && <div className="mt-1 break-words text-xs font-semibold text-amber-700">{unavailable}</div>}
+                        </div>
+                        <div className="flex min-w-0 flex-col items-start justify-center gap-1 text-left md:items-center md:text-center">
+                          <span className="mb-1 block text-xs font-semibold text-muted-foreground md:hidden">状态</span>
+                          <Badge variant={statusVariant(displayRecord.status)}>{statusText(displayRecord.status)}</Badge>
+                          <span className="break-words text-xs text-muted-foreground md:max-w-full md:truncate">{statusText(displayRecord.phase)}</span>
+                        </div>
+                        <div className="min-w-0">
+                          <span className="mb-1 block text-xs font-semibold text-muted-foreground md:hidden">操作</span>
+                          <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap sm:justify-start md:justify-end">
+                            <Button className="w-full sm:w-auto" variant="outline" size="sm" onClick={() => onView(displayRecord)}>{expanded ? "收起" : "查看"}</Button>
+                            <Button className="w-full sm:w-auto" variant="secondary" size="sm" onClick={() => onCopy(record)}>
+                              <Copy className="mr-1 h-3.5 w-3.5" />
+                              复制
+                            </Button>
+                            <Button className="w-full sm:w-auto" variant="default" size="sm" onClick={() => onResume(displayRecord)} disabled={continueDisabled} title={unavailable || undefined}>
+                              <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                              继续
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                      {expanded && <PipelineRunDetailPanel record={displayRecord} />}
+                    </React.Fragment>
+                  );
+                })}
               </div>
               <div className="flex flex-col gap-3 border-t border-border bg-muted/30 px-3 py-3 text-sm text-muted-foreground lg:flex-row lg:items-center lg:justify-between">
                 <div>
@@ -2679,8 +3858,8 @@ function PipelineRunDetailPanel({ record }) {
   const progress = progressForPhaseCards(cards);
   return (
     <div className="bg-cyan-50/40 px-3 py-4" data-testid="pipeline-run-detail">
-      <div className="grid items-stretch gap-4 rounded-lg border border-cyan-200 bg-card p-4 xl:grid-cols-2">
-        <div className="min-w-0 space-y-4">
+      <div className="grid min-w-0 items-start gap-4 rounded-lg border border-cyan-200 bg-card p-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,.9fr)] xl:items-stretch">
+        <div className="min-w-0 space-y-4" data-testid="run-detail-main-column">
           <div className="space-y-2">
             <div className="flex items-center justify-between text-sm">
               <span className="font-semibold">宏观进度</span>
@@ -2693,10 +3872,10 @@ function PipelineRunDetailPanel({ record }) {
               <PhasePill key={item.id} item={item} />
             ))}
           </div>
-          <ServiceSnapshotList services={record.serviceSnapshot || []} />
+          <BuildStageDetailPanel record={record} />
           <CurrentRunStatus run={record} />
         </div>
-        <div className="flex min-h-0 min-w-0 flex-col" data-testid="run-activity-panel">
+        <div className="flex min-h-0 min-w-0 flex-col overflow-hidden xl:self-stretch" data-testid="run-activity-panel">
           <div className="mb-2 flex items-center justify-between gap-3">
             <div>
               <div className="font-semibold">Run 活动日志</div>
@@ -2718,8 +3897,8 @@ function PipelineRunDraftDetailPanel({ record }) {
   const services = selectedServicesText(record.serviceSnapshot || []);
   return (
     <div className="bg-cyan-50/40 px-3 py-4" data-testid="pipeline-run-detail">
-      <div className="grid items-stretch gap-4 rounded-lg border border-cyan-200 bg-card p-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,.9fr)]">
-        <div className="min-w-0 space-y-3">
+      <div className="grid min-w-0 items-start gap-4 rounded-lg border border-cyan-200 bg-card p-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,.9fr)] xl:items-stretch">
+        <div className="min-w-0 space-y-3" data-testid="run-detail-main-column">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="font-semibold">待启动配置</div>
@@ -2739,7 +3918,7 @@ function PipelineRunDraftDetailPanel({ record }) {
           </div>
           <ServiceSnapshotList services={record.serviceSnapshot || []} />
         </div>
-        <div className="flex min-h-0 min-w-0 flex-col" data-testid="run-activity-panel">
+        <div className="flex min-h-0 min-w-0 flex-col overflow-hidden xl:self-stretch" data-testid="run-activity-panel">
           <div className="mb-2 flex items-center justify-between gap-3">
             <div>
               <div className="font-semibold">Run 活动日志</div>
@@ -2769,6 +3948,447 @@ function ServiceSnapshotList({ services = [] }) {
           </span>
         ))}
       </div>
+    </div>
+  );
+}
+
+function buildStageStatusIcon(status) {
+  if (status === "done") return CheckCircle2;
+  if (status === "failed") return XCircle;
+  if (status === "blocked") return AlertTriangle;
+  if (status === "running") return Loader2;
+  return ClipboardList;
+}
+
+function buildStageRowClass(status) {
+  if (status === "done") return "border-l-emerald-500";
+  if (status === "failed") return "border-l-red-500";
+  if (status === "blocked") return "border-l-amber-500";
+  if (status === "running") return "border-l-cyan-500";
+  return "border-l-border";
+}
+
+function stageSkeletonFromStructureDetail(structureDetail = null) {
+  const avgRows = Array.isArray(structureDetail?.avg) ? structureDetail.avg : [];
+  const labels = avgRows
+    .map((row) => String(row.stageName || row.name || "").trim())
+    .filter(Boolean);
+  if (!labels.length) return BUILD_DETAIL_STAGES;
+  return labels.map((label, index) => buildStageDefinitionForLabel(label, index));
+}
+
+function stageSkeletonForRows(rows = [], structureDetail = null) {
+  const skeleton = stageSkeletonFromStructureDetail(structureDetail);
+  const hasNpmBuild = rows.some((row) => normalizeBuildStageLabel(row.label || row.name) === "npm build");
+  const hasMavenBuild = rows.some((row) => normalizeBuildStageLabel(row.label || row.name) === "maven build");
+  if (skeleton === BUILD_DETAIL_STAGES && hasNpmBuild && !hasMavenBuild) {
+    return BUILD_DETAIL_STAGES.map((stage, index) =>
+      normalizeBuildStageLabel(stage.label) === "maven build"
+        ? buildStageDefinitionForLabel("Npm Build", index)
+        : stage
+    );
+  }
+  return skeleton;
+}
+
+function pendingBuildStageRows(skeleton = BUILD_DETAIL_STAGES) {
+  return skeleton.map((stage) => ({
+    ...stage,
+    status: "pending",
+    detail: "等待本次构建进入该阶段。",
+    source: "run-pending"
+  }));
+}
+
+function mergeBuildStageRowsWithPending(rows = [], skeleton = BUILD_DETAIL_STAGES) {
+  const rowByLabel = new Map(rows.map((row) => [normalizeBuildStageLabel(row.label || row.name), row]));
+  const knownLabels = new Set(skeleton.map((stage) => normalizeBuildStageLabel(stage.label)));
+  const merged = skeleton.map((stage) => {
+    const actual = rowByLabel.get(normalizeBuildStageLabel(stage.label));
+    if (!actual) {
+      return {
+        ...stage,
+        status: "pending",
+        detail: "等待本次构建进入该阶段。",
+        source: "run-pending"
+      };
+    }
+    return {
+      ...stage,
+      ...actual,
+      id: stage.id,
+      label: stage.label,
+      name: stage.name
+    };
+  });
+  const extraRows = rows.filter((row) => !knownLabels.has(normalizeBuildStageLabel(row.label || row.name)));
+  return [...merged, ...extraRows];
+}
+
+function serviceStageRowsForDisplay(item = {}, logState = {}) {
+  if (item.structureStageRows?.length) {
+    return mergeBuildStageRowsWithPending(item.structureStageRows, stageSkeletonForRows(item.structureStageRows, item.structureDetail));
+  }
+  if (logState.rows?.length) {
+    return mergeBuildStageRowsWithPending(logState.rows, stageSkeletonForRows(logState.rows, item.structureDetail));
+  }
+  return pendingBuildStageRows(stageSkeletonForRows([], item.structureDetail));
+}
+
+function ServiceBuildProgressList({ items = [], logStates = {}, logRequests = {}, liveStates = {}, onReadLog }) {
+  if (!items.length) return null;
+  return (
+    <div className="min-w-0 space-y-3" data-testid="service-build-progress-list">
+      <div className="text-xs font-semibold text-muted-foreground">服务构建进度</div>
+      <div className="grid min-w-0 gap-3">
+        {items.map((item) => {
+          const Icon = buildStageStatusIcon(item.status);
+          const logState = logStates[item.key] || {};
+          const stageText = serviceBuildStageText(item, { logState });
+          const buildIdText = item.buildId || item.candidateBuildIds?.join(", ") || item.candidateBuildId || "-";
+          const stageRows = serviceStageRowsForDisplay(item, logState);
+          const logText = buildLogDisplayText(logState.result);
+          const lockRunSource = ["failed", "blocked"].includes(item.status) && item.source === "Run 阶段";
+          const sourceText = lockRunSource ? item.source : item.source || "-";
+          const hasLogRequest = Boolean(logRequests[item.key]);
+          return (
+            <div
+              key={item.key}
+              className={cn("min-w-0 space-y-3 overflow-hidden rounded-lg border border-l-4 border-border bg-card p-3", buildStageRowClass(item.status))}
+              data-testid="service-build-progress-row"
+            >
+              <div className="grid gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1.4fr)_auto]">
+                <div className="flex min-w-0 items-start gap-2">
+                  <Icon className={cn("mt-0.5 h-4 w-4 shrink-0", item.status === "running" && "animate-spin")} />
+                  <div className="min-w-0">
+                    <div className="break-all text-sm font-semibold">{item.name}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{item.applicationCode} / {item.branch}</div>
+                  </div>
+                </div>
+                <div className="min-w-0 text-xs text-muted-foreground">
+                  <div className="font-semibold text-foreground">版本 {item.targetVersion || "-"}</div>
+                  <div className="mt-1 break-all">构建号 {buildIdText}</div>
+                  <div className="mt-1 break-all">来源 {sourceText}</div>
+                </div>
+                <div className="min-w-0 break-words text-xs text-muted-foreground">
+                  <span className="font-semibold text-foreground">阶段 </span>{stageText}
+                </div>
+                <div className="flex flex-wrap items-center gap-2 md:justify-end">
+                  <Badge className="w-fit" variant={statusVariant(item.status)}>{item.statusLabel || statusText(item.status)}</Badge>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => onReadLog?.(item.key)}
+                    disabled={!hasLogRequest || logState.loading}
+                  >
+                    {logState.loading ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Search className="mr-1 h-3.5 w-3.5" />}
+                    {logState.loading ? "读取中" : "日志"}
+                  </Button>
+                </div>
+              </div>
+              <div className="grid min-w-0 gap-2" data-testid="service-build-stage-list">
+                {stageRows.map((stage) => {
+                  const StageIcon = buildStageStatusIcon(stage.status);
+                  return (
+                    <div
+                      key={`${item.key}-${stage.id}`}
+                      className={cn("grid min-w-0 gap-3 rounded-md border border-l-4 border-border bg-muted/25 p-3 sm:grid-cols-[minmax(0,170px)_minmax(0,1fr)_auto]", buildStageRowClass(stage.status))}
+                      data-testid="service-build-stage-row"
+                    >
+                      <div className="flex min-w-0 items-start gap-2">
+                        <StageIcon className={cn("mt-0.5 h-4 w-4 shrink-0", stage.status === "running" && "animate-spin")} />
+                        <div className="min-w-0">
+                          <div className="break-words text-sm font-semibold">{stage.name}</div>
+                          <div className="mt-1 font-mono text-xs text-muted-foreground">{stage.label}</div>
+                        </div>
+                      </div>
+                      <div className="min-w-0 break-words text-xs text-muted-foreground sm:text-sm">{stage.detail}</div>
+                      <Badge className="w-fit" variant={statusVariant(stage.status)}>{statusText(stage.status)}</Badge>
+                    </div>
+                  );
+                })}
+              </div>
+              {logState.loading && (
+                <div className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs text-cyan-800" data-testid="service-build-log-loading">
+                  正在读取该服务的 Jenkins 原始日志。
+                </div>
+              )}
+              {logState.error && (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800" data-testid="service-build-log-error">
+                  {logState.error}
+                </div>
+              )}
+              {logState.notice && (
+                <div className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs text-cyan-800" data-testid="service-build-log-notice">
+                  {logState.notice}
+                </div>
+              )}
+              {logText && (
+                <pre className="max-h-[60vh] min-h-[220px] max-w-full min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 font-mono text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]" data-testid="service-build-log">
+                  {logText}
+                </pre>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function buildLogDisplayText(logResult) {
+  return buildLogText(logResult).replace(/\r/g, "").trim();
+}
+
+function isBuildLogNotReadyResult(result = {}) {
+  return result?.reason === "build_log_not_ready" || result?.error === "build_log_not_ready";
+}
+
+function BuildStageDetailPanel({ record }) {
+  const [liveSignals, setLiveSignals] = useState([]);
+  const [liveStates, setLiveStates] = useState({});
+  const [serviceLogStates, setServiceLogStates] = useState({});
+  const normalizedRecord = useMemo(() => normalizePipelineRunRecord(record), [record]);
+  const services = normalizedRecord.serviceSnapshot || [];
+  const items = useMemo(() => serviceBuildStatusItems(record, liveSignals), [record, liveSignals]);
+  const logRequests = useMemo(() => Object.fromEntries(items
+    .map((item) => [item.key, buildLogRequestForServiceItem(record, item)])
+    .filter(([, request]) => request)), [record, items]);
+  const logRequestKey = useMemo(() => JSON.stringify(logRequests), [logRequests]);
+  const serviceStatusRequestKey = useMemo(() => JSON.stringify({
+    target: {
+      profileId: normalizedRecord.target?.profileId || "",
+      accountId: normalizedRecord.target?.accountId || "",
+      customerNameEn: normalizedRecord.target?.customerNameEn || "",
+      appCode: normalizedRecord.target?.appCode || "",
+      branch: normalizedRecord.target?.branch || ""
+    },
+    services: services.map((service, index) => ({
+      key: serviceBuildStatusItemKey(service, index),
+      applicationCode: service.applicationCode || "",
+      codeBranch: service.codeBranch || "",
+      imageJenkinsName: service.imageJenkinsName || serviceDisplayName(service),
+      imageVersion: service.generatedVersion || service.imageVersion || "",
+      candidateBuildIds: items[index]?.candidateBuildIds || []
+    }))
+  }), [normalizedRecord, services, items]);
+
+  useEffect(() => {
+    const entries = items.map((item) => {
+      const service = services[item.serviceIndex] || services.find((entry) => serviceDisplayName(entry) === item.name) || {};
+      return {
+        key: item.key,
+        service,
+        request: buildServiceStatusRequestForService(record, service, item),
+        baseline: directBuildBaselineForService(service, normalizedRecord.context?.data?.buildBaseline || {})
+      };
+    }).filter((entry) => entry.request);
+
+    if (!entries.length) {
+      setLiveSignals([]);
+      setLiveStates({});
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timer = null;
+
+    async function readLiveServiceStatus(silent = false) {
+      if (!silent) {
+        setLiveStates((current) => ({
+          ...current,
+          ...Object.fromEntries(entries.map((entry) => [entry.key, {
+            ...(current[entry.key] || {}),
+            loading: true,
+            error: ""
+          }]))
+        }));
+      }
+
+      const nextSignals = [];
+      const nextStates = {};
+      for (const entry of entries) {
+        try {
+          const data = await apiFetchWithRetry("/api/probe/build-service", entry.request, {
+            attempts: READ_RETRY_ATTEMPTS,
+            delayMs: READ_RETRY_DELAY_MS
+          });
+          if (cancelled) return;
+          const result = data.result || data;
+          if (!result?.ok) {
+            nextStates[entry.key] = {
+              loading: false,
+              error: summarizeFailure(result),
+              updatedAt: Date.now()
+            };
+            continue;
+          }
+          const signal = buildSignalForService(entry.service, result, { baseline: entry.baseline });
+          nextSignals.push({
+            ...signal,
+            source: "平台实时读取",
+            structureDetail: result.structureDetail || null,
+            at: signal.at || Date.now()
+          });
+          nextStates[entry.key] = {
+            loading: false,
+            error: "",
+            updatedAt: Date.now()
+          };
+        } catch (error) {
+          if (cancelled) return;
+          nextStates[entry.key] = {
+            loading: false,
+            error: error.message || "读取构建状态失败",
+            updatedAt: Date.now()
+          };
+        }
+      }
+
+      if (!cancelled) {
+        setLiveSignals(nextSignals);
+        setLiveStates((current) => ({ ...current, ...nextStates }));
+      }
+    }
+
+    readLiveServiceStatus(false);
+    if (aggregateBuildStatusFromItems(record, items) === "running") {
+      timer = window.setInterval(() => readLiveServiceStatus(true), Math.max(PIPELINE_OBSERVER_INTERVAL_MS, 5000));
+    }
+
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [serviceStatusRequestKey, record, items]);
+
+  async function readServiceBuildLogs(keys, options = {}) {
+    const activeKeys = keys.filter((key) => logRequests[key]);
+    if (!activeKeys.length) return;
+    const silent = Boolean(options.silent);
+    if (!silent) {
+      setServiceLogStates((current) => ({
+        ...current,
+        ...Object.fromEntries(activeKeys.map((key) => [key, {
+          ...(current[key] || {}),
+          loading: true,
+          error: "",
+          notice: ""
+        }]))
+      }));
+    }
+
+    for (const key of activeKeys) {
+      if (options.cancelled?.()) return;
+      try {
+        const request = await resolveBuildLogRequestForKey(key);
+        const data = await apiFetch("/api/probe/build-log", request);
+        if (options.cancelled?.()) return;
+        const result = data.result || data;
+        if (!result?.ok) {
+          if (isBuildLogNotReadyResult(result)) {
+            setServiceLogStates((current) => ({
+              ...current,
+              [key]: {
+                ...(current[key] || {}),
+                result: null,
+                rows: [],
+                loading: false,
+                error: "",
+                notice: "Jenkins 原始日志暂未生成或平台尚未开放读取，后台会随运行中观察继续尝试。"
+              }
+            }));
+            continue;
+          }
+          setServiceLogStates((current) => ({
+            ...current,
+            [key]: {
+              ...(current[key] || {}),
+              result: null,
+              rows: [],
+              loading: false,
+              error: summarizeFailure(result),
+              notice: ""
+            }
+          }));
+          continue;
+        }
+        setServiceLogStates((current) => ({
+          ...current,
+          [key]: {
+            ...(current[key] || {}),
+            result,
+            rows: buildStageRowsFromLogResult(result),
+            loading: false,
+            error: "",
+            notice: ""
+          }
+        }));
+      } catch (error) {
+        if (options.cancelled?.()) return;
+        setServiceLogStates((current) => ({
+          ...current,
+          [key]: {
+            ...(current[key] || {}),
+            result: null,
+            rows: [],
+            loading: false,
+            error: error.message || "读取原始构建日志失败",
+            notice: ""
+          }
+        }));
+      }
+    }
+  }
+
+  useEffect(() => {
+    setServiceLogStates({});
+  }, [logRequestKey]);
+
+  async function resolveBuildLogRequestForKey(key) {
+    const item = items.find((entry) => entry.key === key);
+    const fallbackRequest = logRequests[key];
+    if (!item || !fallbackRequest || fallbackRequest.buildId) return fallbackRequest;
+    const service = services[item.serviceIndex] || services.find((entry) => serviceDisplayName(entry) === item.name) || {};
+    const statusRequest = buildServiceStatusRequestForService(record, service, item);
+    if (!statusRequest) return fallbackRequest;
+    try {
+      const data = await apiFetchWithRetry("/api/probe/build-service", statusRequest, {
+        attempts: READ_RETRY_ATTEMPTS,
+        delayMs: READ_RETRY_DELAY_MS
+      });
+      const result = data.result || data;
+      if (!result?.ok) return fallbackRequest;
+      const signal = buildSignalForService(service, result, {
+        baseline: directBuildBaselineForService(service, normalizedRecord.context?.data?.buildBaseline || {})
+      });
+      setLiveSignals((current) => [
+        {
+          ...signal,
+          source: "平台实时读取",
+          structureDetail: result.structureDetail || null,
+          at: signal.at || Date.now()
+        },
+        ...current.filter((entry) => String(entry.service || "") !== String(signal.service || ""))
+      ]);
+      return buildLogRequestForServiceItem(record, {
+        ...item,
+        structureDetail: result.structureDetail || item.structureDetail
+      }) || fallbackRequest;
+    } catch {
+      return fallbackRequest;
+    }
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3" data-testid="build-stage-detail-panel" aria-live="polite">
+      <ServiceBuildProgressList
+        items={items}
+        logStates={serviceLogStates}
+        logRequests={logRequests}
+        liveStates={liveStates}
+        onReadLog={(key) => readServiceBuildLogs([key], { silent: false })}
+      />
     </div>
   );
 }
@@ -2806,7 +4426,8 @@ function ReleaseOnlyPanel({ releaseNeeded, releasePlan, releaseApp, running, ref
   );
 }
 
-function PipelineActionBar({ services, flow, running, onStart, onRemove, onClear }) {
+function PipelineActionBar({ services, hiddenServices = [], flow, running, onStart, onRemove, onRemoveHidden, onClear }) {
+  const hasHiddenServices = hiddenServices.length > 0;
   return (
     <div className="rounded-lg border border-cyan-200 bg-cyan-50/80 p-3">
       <div className="flex flex-col gap-3">
@@ -2819,7 +4440,7 @@ function PipelineActionBar({ services, flow, running, onStart, onRemove, onClear
             {SERVICE_ROW_PIPELINES.map((item) => {
               const Icon = item.icon;
               return (
-                <Button key={item.id} variant={item.tone} size="sm" onClick={() => onStart(item.id)} disabled={running}>
+                <Button key={item.id} variant={item.tone} size="sm" onClick={() => onStart(item.id)} disabled={running || hasHiddenServices}>
                   {running ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Icon className="mr-2 h-4 w-4" />}
                   {item.shortLabel}
                 </Button>
@@ -2828,6 +4449,24 @@ function PipelineActionBar({ services, flow, running, onStart, onRemove, onClear
             <Button variant="outline" size="sm" onClick={onClear} disabled={running}>清空选择</Button>
           </div>
         </div>
+        {hasHiddenServices && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800" data-testid="hidden-selection-warning">
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+              <div className="flex min-w-0 gap-2">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <div className="min-w-0">
+                  <div className="font-semibold">已拦截隐藏服务选择</div>
+                  <div className="mt-1 break-words">
+                    这些服务不在当前服务页或过滤结果中，不会允许批量启动：{selectedServicesText(hiddenServices)}
+                  </div>
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={onRemoveHidden} disabled={running}>
+                移除隐藏项
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="flex flex-wrap gap-2">
           {services.map((service) => (
             <button
@@ -2941,20 +4580,20 @@ function ServiceList({ rows, pageInfo, pageSize, profile, appCode, branch, selec
 function ActivityLog({ items, stretch = false }) {
   if (!items?.length) {
     return (
-      <div className={cn("rounded-lg border border-dashed border-border bg-muted/40 p-6 text-center text-sm text-muted-foreground", stretch && "flex min-h-[360px] flex-1 items-center justify-center")}>
+      <div className={cn("rounded-lg border border-dashed border-border bg-muted/40 p-6 text-center text-sm text-muted-foreground", stretch && "flex h-[360px] min-h-0 flex-none items-center justify-center overflow-hidden xl:h-0 xl:min-h-[360px] xl:flex-1")}>
         点击服务行上的 Pipeline 按钮后，这里会记录预检、构建、发布、失败和重试证据。
       </div>
     );
   }
   return (
-    <ScrollArea className={cn("pr-3", stretch ? "min-h-[360px] flex-1" : "h-[360px]")}>
-      <div className="space-y-2">
+    <ScrollArea className={cn("min-w-0 pr-3", stretch ? "h-[360px] min-h-0 flex-none xl:h-0 xl:min-h-[360px] xl:flex-1" : "h-[360px]")}>
+      <div className="min-w-0 space-y-2">
         {items.map((item, index) => (
-          <div key={`${item.at}-${index}`} className="rounded-lg border border-border bg-card p-3">
+          <div key={`${item.at}-${index}`} className="min-w-0 rounded-lg border border-border bg-card p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="font-semibold">{item.title}</div>
-                <p className="break-words text-sm text-muted-foreground">{summarizeFailure(item.detail)}</p>
+                <p className="break-words text-sm text-muted-foreground [overflow-wrap:anywhere]">{summarizeFailure(item.detail)}</p>
               </div>
               <Badge variant={item.tone === "danger" ? "danger" : item.tone === "warning" ? "warning" : item.tone === "success" ? "success" : "outline"}>{item.tone}</Badge>
             </div>

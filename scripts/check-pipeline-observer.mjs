@@ -2,6 +2,7 @@ import assert from "node:assert";
 
 import {
   buildApplySignal,
+  buildObservationBaselineForService,
   buildPlatformPublishEnvironmentsFor,
   buildPlatformPublishProgress,
   buildPlatformPublishSubmittedSignal,
@@ -54,6 +55,99 @@ const succeededBuild = buildSignalForService(service, {
   }]
 });
 assert.strictEqual(succeededBuild.status, "succeeded", "newer success timestamp completes the build observation");
+
+const directBuildBaseline = buildObservationBaselineForService(service, {
+  detail: [{
+    imageJenkinsName: "prescription-mem-ewell-mastertest",
+    imageNameEn: "prescription-mem-ewell",
+    imageVersion: "v1.62.001",
+    lastSuccessTime: 30,
+    lastFailureTime: 20,
+    lastSuccessId: "#201",
+    lastFailureId: "#199"
+  }]
+});
+assert.deepStrictEqual(
+  directBuildBaseline,
+  {
+    imageVersion: "v1.62.001",
+    lastSuccessTime: 30,
+    lastFailureTime: 20,
+    lastSuccessId: "#201",
+    lastFailureId: "#199"
+  },
+  "direct-build observation stores the pre-trigger build markers as a baseline"
+);
+const directBuildStillRunning = buildSignalForService(service, {
+  detail: [{
+    imageJenkinsName: "prescription-mem-ewell-mastertest",
+    imageNameEn: "prescription-mem-ewell",
+    imageVersion: "v1.62.001",
+    lastSuccessTime: 30,
+    lastFailureTime: 20,
+    lastSuccessId: "#201",
+    lastFailureId: "#199"
+  }]
+}, { baseline: directBuildBaseline });
+assert.strictEqual(
+  directBuildStillRunning.status,
+  "running",
+  "develop direct-build observation must not treat the pre-trigger success as this run's success"
+);
+assert.deepStrictEqual(
+  directBuildStillRunning.candidateBuildIds,
+  ["#202", "#203", "#204"],
+  "running build observation should expose candidate Jenkins build IDs for live log polling"
+);
+assert.strictEqual(
+  buildSignalForService(service, {
+    detail: [{
+      imageJenkinsName: "prescription-mem-ewell-mastertest",
+      imageNameEn: "prescription-mem-ewell",
+      imageVersion: "v1.62.001",
+      lastSuccessTime: 40,
+      lastFailureTime: 20,
+      lastSuccessId: "#202",
+      lastFailureId: "#199"
+    }]
+  }, { baseline: directBuildBaseline }).status,
+  "succeeded",
+  "develop direct-build observation succeeds only after a newer success marker appears"
+);
+assert.strictEqual(
+  buildSignalForService({
+    ...service,
+    generatedVersion: "v1.62.001",
+    imageVersion: "v1.62.001"
+  }, {
+    detail: [{
+      imageJenkinsName: "prescription-mem-ewell-mastertest",
+      imageNameEn: "prescription-mem-ewell",
+      imageVersion: "v2026.0608.104413",
+      lastSuccessTime: 40,
+      lastFailureTime: 20,
+      lastSuccessId: "#202",
+      lastFailureId: "#199"
+    }]
+  }, { baseline: directBuildBaseline }).status,
+  "succeeded",
+  "develop direct-build observation accepts a post-baseline new success even when the reused Run snapshot still has an old target version"
+);
+assert.strictEqual(
+  buildSignalForService(service, {
+    detail: [{
+      imageJenkinsName: "prescription-mem-ewell-mastertest",
+      imageNameEn: "prescription-mem-ewell",
+      imageVersion: "v1.62.001",
+      lastSuccessTime: 30,
+      lastFailureTime: 45,
+      lastSuccessId: "#201",
+      lastFailureId: "#203"
+    }]
+  }, { baseline: directBuildBaseline }).status,
+  "failed",
+  "develop direct-build observation fails when a newer failure marker appears"
+);
 
 const waitingRelease = releaseRecordSignal({ applicationCode: "mem", applicationVersion: "1.2.90", toPublishServiceNum: 0 });
 assert.strictEqual(waitingRelease.status, "waiting", "zero pending target-app release records are not publishable");

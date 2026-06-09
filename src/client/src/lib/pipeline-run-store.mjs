@@ -1,31 +1,38 @@
-export const PIPELINE_RUN_HISTORY_KEY = "pipeline-run-history-v1";
+import { createFlowContract } from "./pipeline-flow-contract.mjs";
+import { buildPipelineRun } from "./pipeline-run-builder.mjs";
+import {
+  applyCommandEventToMemento,
+  createPipelineRunMemento,
+  normalizePipelineRunMemento,
+  resumePointFromMemento
+} from "./pipeline-run-memento.mjs";
+
+export const PIPELINE_RUN_HISTORY_KEY = "pipeline-run-history-v2";
 export const PIPELINE_RUN_HISTORY_LIMIT = 80;
 export const DEFAULT_RELEASE_REASON = "功能更新";
 export const DEFAULT_RELEASE_NOTICE = "测试";
 export const RUNNING_STALE_AFTER_MS = 60 * 60 * 1000;
+export const PIPELINE_RUN_SCHEMA_VERSION = 2;
 
 const TERMINAL_SUCCESS = new Set(["done", "cancelled"]);
 const RESUMABLE_STATUS = new Set(["draft", "blocked", "failed"]);
-const BAD_STATUS_PRIORITY = ["failed", "blocked", "running"];
 const SERVICE_ROW_PIPELINE_IDS = ["build-and-release", "build-only"];
-const RELEASE_RESUME_POINTS = [
-  { id: "release", pipelineId: "release", stage: "release", stageId: "publish", stepId: "complete-release", phase: "发布" },
-  { id: "publish-spot", pipelineId: "release", stage: "release", stageId: "publish", stepId: "publish-spot", phase: "现场发布" },
-  { id: "publish-company", pipelineId: "release", stage: "release", stageId: "publish", stepId: "publish-company", phase: "公司发布" },
-  { id: "release-detail", pipelineId: "release", stage: "release", stageId: "release-detail", stepId: "read-release-detail", phase: "发布清单" },
-  { id: "release-observe", pipelineId: "release", stage: "release", stageId: "release-observe", stepId: "wait-release-record", phase: "等待发布记录" }
+const BUILD_COMMAND_IDS = [
+  "read-build-status",
+  "generate-version",
+  "create-or-reuse-task",
+  "wait-buildable-task",
+  "trigger-build",
+  "observe-build",
+  "confirm-build-platform-publish"
 ];
-const BUILD_RESUME_POINTS = [
-  { id: "build-platform-publish", pipelineId: "build", stage: "build", stageId: "build-platform-publish", stepId: "confirm-build-platform-publish", phase: "构建平台发布" },
-  { id: "build-apply-observe", pipelineId: "build", stage: "build", stageId: "build-observe", stepId: "observe-build-apply", phase: "等待构建完成" },
-  { id: "build-observe", pipelineId: "build", stage: "build", stageId: "build-observe", stepId: "observe-build", phase: "等待构建完成" },
-  { id: "build", pipelineId: "build", stage: "build", stageId: "build", stepId: "trigger-build", phase: "构建" },
-  { id: "build-task", pipelineId: "build", stage: "build", stageId: "build-task", stepId: "wait-buildable-task", phase: "等待构建任务" },
-  { id: "create-task", pipelineId: "build", stage: "build", stageId: "build-task", stepId: "create-or-reuse-task", phase: "创建构建任务" },
-  { id: "version", pipelineId: "build", stage: "build", stageId: "prepare", stepId: "generate-version", phase: "版本预检" },
-  { id: "build-status", pipelineId: "build", stage: "build", stageId: "prepare", stepId: "read-build-status", phase: "构建预检" },
-  { id: "probe", pipelineId: "build", stage: "prepare", stageId: "prepare", stepId: "probe-platforms", phase: "构建预检" }
+const RELEASE_COMMAND_IDS = [
+  "wait-release-record",
+  "read-release-detail",
+  "publish-company",
+  "publish-spot"
 ];
+const BAD_STATUS_PRIORITY = ["failed", "blocked", "running"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -40,86 +47,14 @@ function cloneJson(value, fallback) {
   }
 }
 
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function epochMs(value) {
   const date = new Date(value || "");
   const time = date.getTime();
   return Number.isFinite(time) ? time : 0;
-}
-
-function isStaleRunningRecord(record = {}, nowMs = Date.now()) {
-  if (record.status !== "running") return false;
-  const lastTouched = epochMs(record.updatedAt || record.createdAt);
-  return lastTouched > 0 && nowMs - lastTouched >= RUNNING_STALE_AFTER_MS;
-}
-
-function normalizeStaleRunningRecord(record = {}) {
-  if (!isStaleRunningRecord(record)) return record;
-  const outcomes = cloneJson(record.outcomes || {}, {});
-  for (const [id, outcome] of Object.entries(outcomes)) {
-    if (outcome?.status === "running") {
-      outcomes[id] = {
-        ...outcome,
-        status: "blocked",
-        detail: outcome.detail
-          ? `${outcome.detail}；历史 Run 长时间未更新，已转为可继续状态。`
-          : "历史 Run 长时间未更新，已转为可继续状态。"
-      };
-    }
-  }
-  return {
-    ...record,
-    status: "blocked",
-    phase: record.phase || "等待处理",
-    outcomes,
-    activity: [{
-      at: nowIso(),
-      title: "Pipeline 状态修复",
-      detail: "历史 Run 长时间停留在 running，已转为暂停，可从当前阶段继续。",
-      tone: "warning"
-    }, ...asArray(record.activity || [])].slice(0, 120)
-  };
-}
-
-function normalizeContradictoryOutcomes(record = {}) {
-  const outcomes = cloneJson(record.outcomes || {}, {});
-  const buildStatus = outcomes.build?.status;
-  if ((buildStatus === "failed" || buildStatus === "blocked") && outcomes["build-observe"]?.status === "running") {
-    outcomes["build-observe"] = {
-      ...outcomes["build-observe"],
-      status: buildStatus,
-      detail: outcomes.build.detail || outcomes["build-observe"].detail || "构建阶段已失败。"
-    };
-  }
-  const releaseStatus = outcomes.release?.status;
-  if ((releaseStatus === "failed" || releaseStatus === "blocked") && outcomes["release-observe"]?.status === "running") {
-    outcomes["release-observe"] = {
-      ...outcomes["release-observe"],
-      status: releaseStatus,
-      detail: outcomes.release.detail || outcomes["release-observe"].detail || "发布阶段已暂停。"
-    };
-  }
-  return { ...record, outcomes };
-}
-
-function normalizePhaseForResumeStage(record = {}, resumePoint) {
-  const phase = record.phase || "待选择";
-  if (record.status === "failed" || record.status === "blocked") {
-    if (resumePoint?.stage === "build") {
-      if (resumePoint.id === "build" || resumePoint.id === "build-observe" || resumePoint.id === "build-apply-observe") {
-        return record.status === "failed" ? "构建失败" : "等待构建完成";
-      }
-      return resumePoint.phase || "等待构建完成";
-    }
-    if (resumePoint?.stage === "release") {
-      return resumePoint.phase || "等待发布记录";
-    }
-  }
-  if (resumePoint?.stage === "build" && /发布/.test(phase)) return resumePoint.phase || "等待构建完成";
-  return phase;
-}
-
-function asArray(value) {
-  return Array.isArray(value) ? value : [];
 }
 
 function serviceName(service = {}) {
@@ -127,8 +62,11 @@ function serviceName(service = {}) {
 }
 
 function selectedServicesText(services = []) {
-  const names = asArray(services).map(serviceName).filter(Boolean);
-  return names.join(" / ");
+  return asArray(services).map(serviceName).filter(Boolean).join(" / ");
+}
+
+function normalizeMasterStrategy(strategy) {
+  return strategy === "hotfix" ? "hotfix" : "prod";
 }
 
 export function releaseStagesFor(branch) {
@@ -151,10 +89,6 @@ export function releasePlanText(branch) {
   return stages.map(releaseStageLabel).join(" + ");
 }
 
-function normalizeMasterStrategy(strategy) {
-  return strategy === "hotfix" ? "hotfix" : "prod";
-}
-
 export function buildMode(branch, strategy = "prod") {
   if (branch === "develop") return { mode: "direct", label: "开发直构建", structureType: null };
   if (branch === "release") return { mode: "release-task", label: "提测申请+构建", structureType: "release" };
@@ -169,66 +103,396 @@ export function buildMode(branch, strategy = "prod") {
   return { mode: "apply-task", label: "申请+构建", structureType: "prod" };
 }
 
-function firstStatus(outcomes, ids, statuses = BAD_STATUS_PRIORITY) {
-  for (const status of statuses) {
-    const id = ids.find((item) => outcomes[item]?.status === status);
-    if (id) return { status, outcome: outcomes[id], id };
+function normalizeTarget(target = {}) {
+  return {
+    profileId: target.profileId || "",
+    accountId: target.accountId || "",
+    customerNameEn: target.customerNameEn || "",
+    appCode: target.appCode || target.applicationCode || "",
+    branch: target.branch || target.codeBranch || "",
+    buildStrategy: target.buildStrategy || "prod",
+    releaseEnvId: target.releaseEnvId || target.environmentId || "",
+    releaseEnvLabel: target.releaseEnvLabel || target.environmentLabel || ""
+  };
+}
+
+function normalizeInputs(record = {}) {
+  return {
+    releaseReason: record.context?.inputs?.releaseReason || record.releaseReason || DEFAULT_RELEASE_REASON,
+    releaseNotice: record.context?.inputs?.releaseNotice || record.releaseNotice || DEFAULT_RELEASE_NOTICE
+  };
+}
+
+function commandsForRecord(record = {}) {
+  const target = normalizeTarget(record.target || record.context?.target || {});
+  const inputs = normalizeInputs(record);
+  const services = asArray(record.serviceSnapshot);
+  const commands = asArray(record.commands);
+  if (commands.length) return cloneJson(commands, []);
+  return createFlowContract({
+    templateId: record.templateId || "build-and-release",
+    target,
+    services,
+    inputs
+  }).commands;
+}
+
+function commandById(commands = []) {
+  return new Map(asArray(commands).map((command) => [command.id, command]));
+}
+
+function normalizeContext(record = {}, target = normalizeTarget(record.target)) {
+  const context = cloneJson(record.context || {}, {});
+  return {
+    target: normalizeTarget(context.target || target),
+    inputs: {
+      ...normalizeInputs(record),
+      ...(context.inputs || {})
+    },
+    data: cloneJson(context.data || {}, {})
+  };
+}
+
+function coldServiceSnapshot(services = []) {
+  return asArray(services).map((service = {}) => {
+    const {
+      imageVersion,
+      generatedVersion,
+      buildId,
+      candidateBuildId,
+      candidateBuildIds,
+      buildPower,
+      detail,
+      history,
+      lastSuccessId,
+      lastSuccessTime,
+      lastFailureId,
+      lastFailureTime,
+      ...config
+    } = cloneJson(service, {});
+    return config;
+  });
+}
+
+function syncServiceSnapshotFromBuildImages(services = [], context = {}) {
+  const images = asArray(context?.data?.buildSnapshot?.images);
+  if (!images.length) return cloneJson(asArray(services), []);
+  return asArray(services).map((service = {}) => {
+    const copy = cloneJson(service, {});
+    const match = images.find((image = {}) =>
+      image.imageJenkinsName === copy.imageJenkinsName || image.imageNameEn === copy.imageNameEn
+    );
+    if (!match?.imageVersion) return copy;
+    return {
+      ...copy,
+      generatedVersion: match.imageVersion,
+      imageVersion: match.imageVersion
+    };
+  });
+}
+
+function isLegacyV1Record(record = {}) {
+  return record.schemaVersion !== PIPELINE_RUN_SCHEMA_VERSION && (
+    Object.prototype.hasOwnProperty.call(record, "outcomes") ||
+    Object.prototype.hasOwnProperty.call(record, "resumeStage")
+  );
+}
+
+function incompatibleLegacyRecord(record = {}) {
+  const timestamp = nowIso();
+  const createdAt = record.createdAt || timestamp;
+  const updatedAt = record.updatedAt || createdAt;
+  const target = normalizeTarget(record.target);
+  const inputs = normalizeInputs(record);
+  const serviceSnapshot = cloneJson(asArray(record.serviceSnapshot), []);
+  const draft = buildPipelineRun({
+    templateId: record.templateId || "build-and-release",
+    target,
+    services: serviceSnapshot,
+    inputs,
+    id: record.id || createdAt,
+    now: createdAt
+  });
+  return {
+    ...draft,
+    updatedAt,
+    started: record.started !== false,
+    status: "cancelled",
+    phase: "历史 Run 格式不兼容",
+    releaseReason: inputs.releaseReason,
+    releaseNotice: inputs.releaseNotice,
+    activity: [{
+      at: timestamp,
+      title: "历史 Run 不兼容",
+      detail: "旧 outcomes/resumeStage 历史记录不能通过 PipelineRun v2 继续；请复制配置后生成新的 Run。",
+      tone: "warning"
+    }, ...asArray(record.activity)].slice(0, 120)
+  };
+}
+
+function statusRank(status) {
+  const ranks = {
+    failed: 5,
+    blocked: 4,
+    running: 3,
+    pending: 2,
+    done: 1
+  };
+  return ranks[status] || 0;
+}
+
+function mostImportantStatus(statuses = []) {
+  return statuses.slice().sort((left, right) => statusRank(right) - statusRank(left))[0] || "pending";
+}
+
+function commandStatus(memento = {}, commandId) {
+  return memento.commands?.[commandId]?.status || "pending";
+}
+
+function commandGroupStatus(record = {}, commandIds = []) {
+  if (record.status === "done") return "done";
+  const existingIds = commandIds.filter((id) => record.memento?.commands?.[id]);
+  if (!existingIds.length) return "done";
+  const statuses = existingIds.map((id) => commandStatus(record.memento, id));
+  for (const status of BAD_STATUS_PRIORITY) {
+    if (statuses.includes(status)) return status;
   }
-  return null;
+  return statuses.every((status) => status === "done") ? "done" : "pending";
 }
 
-function buildPhaseStatus(record = {}) {
-  const outcomes = record.outcomes || {};
-  const fatal = firstStatus(outcomes, ["build", "build-observe", "build-apply-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["failed", "blocked"]);
-  if (fatal) return fatal.status;
-  if (outcomes["build-apply-observe"]?.status) return outcomes["build-apply-observe"].status;
-  if (outcomes["build-observe"]?.status) return outcomes["build-observe"].status;
-  if (record.status === "done" && (record.templateId === "build-only" || outcomes.release?.status === "done")) return "done";
-  const active = firstStatus(outcomes, ["build", "build-observe", "build-apply-observe", "build-platform-publish", "build-task", "create-task", "version", "build-status"], ["running"]);
-  if (active) return "running";
-  if (outcomes.build?.status === "done") return "running";
-  if (outcomes["create-task"]?.status === "done" || outcomes["build-task"]?.status === "done" || outcomes.version?.status === "done") return "running";
-  return "pending";
+function currentMementoPhase(record = {}) {
+  const point = resumePointFromMemento(record.memento || {});
+  return point.phase || record.phase || "待启动";
 }
 
-function publishStageStatus(outcomes = {}, stage) {
-  return outcomes[`publish-${stage}`]?.status || "pending";
+function recordStatusFromMemento(record = {}) {
+  if (TERMINAL_SUCCESS.has(record.status)) return record.status;
+  if (record.started === false) return "draft";
+  if (record.status === "running") return "running";
+  const point = resumePointFromMemento(record.memento || {});
+  if (BAD_STATUS_PRIORITY.includes(point.status)) return point.status;
+  if (record.status) return record.status;
+  const statuses = Object.values(record.memento?.commands || {}).map((item) => item.status);
+  const important = mostImportantStatus(statuses);
+  if (important === "failed" || important === "blocked" || important === "running") return important;
+  if (statuses.length && statuses.every((status) => status === "done")) return "done";
+  return record.status || "draft";
 }
 
-function releasePhaseStatus(record = {}) {
-  const branch = record.target?.branch || "";
-  if (!releaseRequired(branch)) return "done";
-  const outcomes = record.outcomes || {};
-  const fatal = firstStatus(outcomes, ["release", "release-observe", "release-detail", "publish-company", "publish-spot"], ["failed", "blocked"]);
-  if (fatal) return fatal.status;
-  if (outcomes["release-observe"]?.status && outcomes["release-observe"].status !== "done") return outcomes["release-observe"].status;
-  const stages = releaseStagesFor(branch);
-  const stageStatuses = stages.map((stage) => publishStageStatus(outcomes, stage));
-  const hasStageEvidence = stages.some((stage) => outcomes[`publish-${stage}`]?.status);
-  if (stageStatuses.length && stageStatuses.every((status) => status === "done")) return "done";
-  if (outcomes.release?.status === "done" && !hasStageEvidence) return "done";
-  if (stageStatuses.some((status) => status === "running")) return "running";
-  if (outcomes["release-detail"]?.status === "done" && stageStatuses.some((status) => status === "done")) return "running";
-  if (outcomes["release-detail"]?.status === "done") return "pending";
-  return outcomes["release-observe"]?.status === "done" ? "pending" : "pending";
+function isStaleRunningRecord(record = {}, nowMs = Date.now()) {
+  const point = resumePointFromMemento(record.memento || {});
+  if (record.status !== "running" && point.status !== "running") return false;
+  const lastTouched = epochMs(record.updatedAt || record.createdAt);
+  return lastTouched > 0 && nowMs - lastTouched >= RUNNING_STALE_AFTER_MS;
+}
+
+function normalizeStaleRunningRecord(record = {}) {
+  if (!isStaleRunningRecord(record)) return record;
+  let memento = cloneJson(record.memento, createPipelineRunMemento(record.commands));
+  const point = resumePointFromMemento(memento);
+  if (point.commandId) {
+    memento = applyCommandEventToMemento(memento, {
+      type: "block",
+      status: "blocked",
+      commandId: point.commandId,
+      title: memento.commands?.[point.commandId]?.title || point.commandId,
+      phase: point.phase || "等待处理",
+      detail: point.detail
+        ? `${point.detail}；历史 Run 长时间未更新，已转为可继续状态。`
+        : "历史 Run 长时间未更新，已转为可继续状态。",
+      tone: "warning",
+      at: nowIso()
+    });
+  }
+  return {
+    ...record,
+    status: "blocked",
+    phase: point.phase || record.phase || "等待处理",
+    memento,
+    activity: [{
+      at: nowIso(),
+      title: "Pipeline 状态修复",
+      detail: "历史 Run 长时间停留在 running，已转为暂停，可从当前命令继续。",
+      tone: "warning"
+    }, ...asArray(record.activity || [])].slice(0, 120)
+  };
+}
+
+export function normalizePipelineRunRecord(record = {}) {
+  if (isLegacyV1Record(record)) return incompatibleLegacyRecord(record);
+
+  const timestamp = nowIso();
+  const target = normalizeTarget(record.target || record.context?.target || {});
+  const inputs = normalizeInputs(record);
+  const commands = commandsForRecord({ ...record, target });
+  const createdAt = record.createdAt || timestamp;
+  const updatedAt = record.updatedAt || createdAt;
+  const context = normalizeContext(record, target);
+  const memento = normalizePipelineRunMemento(record.memento || createPipelineRunMemento(commands), commands);
+  const serviceSnapshot = syncServiceSnapshotFromBuildImages(record.serviceSnapshot, context);
+  const normalized = normalizeStaleRunningRecord({
+    schemaVersion: PIPELINE_RUN_SCHEMA_VERSION,
+    id: record.id || createdAt,
+    copiedFromRunId: record.copiedFromRunId || "",
+    createdAt,
+    updatedAt,
+    completedAt: record.completedAt || "",
+    started: record.started !== false,
+    templateId: record.templateId || "build-and-release",
+    status: record.status || "draft",
+    phase: record.phase || currentMementoPhase({ memento }),
+    target,
+    releaseReason: inputs.releaseReason,
+    releaseNotice: inputs.releaseNotice,
+    serviceSnapshot,
+    context,
+    commands,
+    memento,
+    activity: cloneJson(asArray(record.activity), []).slice(0, 120)
+  });
+  const status = recordStatusFromMemento(normalized);
+  const phase = normalized.phase || currentMementoPhase(normalized);
+  return {
+    ...normalized,
+    status,
+    phase
+  };
+}
+
+export function upsertPipelineRunRecord(records, record, options = {}) {
+  const limit = options.limit || PIPELINE_RUN_HISTORY_LIMIT;
+  const incoming = normalizePipelineRunRecord(record);
+  const existing = asArray(records).find((item) => item.id === incoming.id);
+  const merged = existing
+    ? normalizePipelineRunRecord({
+        ...existing,
+        ...incoming,
+        createdAt: existing.createdAt || incoming.createdAt,
+        updatedAt: incoming.updatedAt || nowIso()
+      })
+    : incoming;
+  return [
+    merged,
+    ...asArray(records).filter((item) => item.id !== incoming.id).map(normalizePipelineRunRecord)
+  ]
+    .sort((left, right) => String(right.updatedAt || right.createdAt).localeCompare(String(left.updatedAt || left.createdAt)))
+    .slice(0, limit);
+}
+
+export function mergePipelineRunHistories(...sources) {
+  let records = [];
+  for (const source of sources) {
+    for (const record of asArray(source)) {
+      records = upsertPipelineRunRecord(records, record);
+    }
+  }
+  return records;
+}
+
+export function canResumePipelineRun(record = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  if (TERMINAL_SUCCESS.has(normalized.status)) return false;
+  if (normalized.status === "running") return false;
+  if (RESUMABLE_STATUS.has(normalized.status)) return true;
+  const point = resumePointFromMemento(normalized.memento);
+  return RESUMABLE_STATUS.has(point.status);
+}
+
+export function blockedPhaseForPipelineError(error) {
+  const text = String(error || "");
+  if (/^build_|build.*timeout|build.*failed|build.*observe/i.test(text)) return "等待构建完成";
+  if (/^release_|^publish_|release.*timeout|publish.*timeout/i.test(text)) return "等待发布记录";
+  return "等待处理";
+}
+
+export function inferResumePoint(record = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  if (normalized.status === "done") {
+    return { id: "complete", commandId: "", stage: "complete", phase: "完成", status: "done", detail: "" };
+  }
+  const point = resumePointFromMemento(normalized.memento);
+  const commands = commandById(normalized.commands);
+  const command = commands.get(point.commandId);
+  return {
+    id: point.commandId || "complete",
+    commandId: point.commandId || "",
+    stage: command?.stage || point.status || "start",
+    phase: point.phase || command?.phase || normalized.phase,
+    status: point.status || normalized.status,
+    detail: point.detail || ""
+  };
+}
+
+export function clonePipelineRunDraft(record = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  return {
+    templateId: normalized.templateId,
+    target: normalized.target,
+    releaseReason: normalized.releaseReason,
+    releaseNotice: normalized.releaseNotice,
+    serviceSnapshot: coldServiceSnapshot(normalized.serviceSnapshot),
+    context: cloneJson({
+      target: normalized.context?.target || normalized.target,
+      inputs: normalized.context?.inputs || normalizeInputs(normalized),
+      data: {}
+    }, {})
+  };
+}
+
+export function clonePipelineRunRecord(record = {}, options = {}) {
+  const normalized = normalizePipelineRunRecord(record);
+  const now = options.now || nowIso();
+  const id = options.id || `${Date.now()}`;
+  const draft = buildPipelineRun({
+    templateId: normalized.templateId,
+    target: normalized.target,
+    services: coldServiceSnapshot(normalized.serviceSnapshot),
+    inputs: normalizeInputs(normalized),
+    id,
+    now
+  });
+  return normalizePipelineRunRecord({
+    ...draft,
+    copiedFromRunId: normalized.id,
+    status: "draft",
+    phase: "已复制",
+    releaseReason: normalized.releaseReason,
+    releaseNotice: normalized.releaseNotice,
+    activity: [{
+      at: now,
+      title: "Pipeline 已复制",
+      detail: `复制自 Run ${normalized.id}`,
+      tone: "default"
+    }]
+  });
 }
 
 export function phaseCardsForRunRecord(record = {}, options = {}) {
-  const branch = record.target?.branch || options.branch || "";
-  const flow = buildMode(branch, record.target?.buildStrategy || options.buildStrategy || "prod");
-  const serviceText = record.serviceSnapshot?.length ? selectedServicesText(record.serviceSnapshot) : options.selectedLabel || "";
-  const completed = record.status === "done";
-  const probeStatus = completed ? "done" : record.outcomes?.probe?.status || (options.buildProbeOk ? "done" : "pending");
-  const probeValue = completed
+  const normalized = normalizePipelineRunRecord(record);
+  const branch = normalized.target?.branch || options.branch || "";
+  const flow = buildMode(branch, normalized.target?.buildStrategy || options.buildStrategy || "prod");
+  const serviceText = normalized.serviceSnapshot?.length ? selectedServicesText(normalized.serviceSnapshot) : options.selectedLabel || "";
+  if (normalized.started === false) {
+    return [
+      { id: "target", label: "服务目标", status: normalized.serviceSnapshot?.length || serviceText ? "done" : "pending", value: serviceText },
+      { id: "probe", label: "探测", status: "pending", value: "待启动" },
+      { id: "build", label: "构建", status: "pending", value: flow.label },
+      { id: "release", label: "发布", status: "pending", value: releasePlanText(branch) }
+    ];
+  }
+  const probeStatus = normalized.status === "done"
+    ? "done"
+    : commandStatus(normalized.memento, "probe-platforms") || (options.buildProbeOk ? "done" : "pending");
+  const probeValue = normalized.status === "done"
     ? "历史已完成"
-    : options.buildProbeOk || record.outcomes?.probe?.status === "done"
+    : probeStatus === "done" || options.buildProbeOk
       ? "平台已读"
       : "待刷新";
   return [
-    { id: "target", label: "服务目标", status: record.serviceSnapshot?.length || serviceText ? "done" : "pending", value: serviceText },
+    { id: "target", label: "服务目标", status: normalized.serviceSnapshot?.length || serviceText ? "done" : "pending", value: serviceText },
     { id: "probe", label: "探测", status: probeStatus, value: probeValue },
-    { id: "build", label: "构建", status: buildPhaseStatus(record), value: flow.label },
-    { id: "release", label: "发布", status: releasePhaseStatus(record), value: releasePlanText(branch) }
+    { id: "build", label: "构建", status: commandGroupStatus(normalized, BUILD_COMMAND_IDS), value: flow.label },
+    { id: "release", label: "发布", status: releaseRequired(branch) ? commandGroupStatus(normalized, RELEASE_COMMAND_IDS) : "done", value: releasePlanText(branch) }
   ];
 }
 
@@ -256,162 +520,6 @@ export function releasePendingSummary({ releaseNeeded, releaseProbeOk, releaseAp
   const count = Number(releaseApp.toPublishServiceNum || 0);
   if (count <= 0) return { text: "发布平台无待处理服务", variant: "success" };
   return { text: `发布平台待处理 ${count} 个服务`, variant: "warning" };
-}
-
-function normalizeTarget(target = {}) {
-  return {
-    profileId: target.profileId || "",
-    accountId: target.accountId || "",
-    customerNameEn: target.customerNameEn || "",
-    appCode: target.appCode || target.applicationCode || "",
-    branch: target.branch || target.codeBranch || "",
-    buildStrategy: target.buildStrategy || "prod",
-    releaseEnvId: target.releaseEnvId || target.environmentId || "",
-    releaseEnvLabel: target.releaseEnvLabel || target.environmentLabel || ""
-  };
-}
-
-export function normalizePipelineRunRecord(record = {}) {
-  const timestamp = nowIso();
-  const source = normalizeContradictoryOutcomes(normalizeStaleRunningRecord(record));
-  const createdAt = record.createdAt || timestamp;
-  const updatedAt = record.updatedAt || createdAt;
-  const resumePoint = inferResumePoint(source);
-  return {
-    id: source.id || createdAt,
-    copiedFromRunId: source.copiedFromRunId || "",
-    createdAt,
-    updatedAt,
-    completedAt: source.completedAt || "",
-    started: source.started !== false,
-    templateId: source.templateId || "build-and-release",
-    status: source.status || "draft",
-    phase: normalizePhaseForResumeStage(source, resumePoint),
-    target: normalizeTarget(source.target),
-    releaseReason: source.releaseReason || DEFAULT_RELEASE_REASON,
-    releaseNotice: source.releaseNotice || DEFAULT_RELEASE_NOTICE,
-    serviceSnapshot: cloneJson(asArray(source.serviceSnapshot), []),
-    buildSnapshot: cloneJson(source.buildSnapshot, null),
-    outcomes: cloneJson(source.outcomes || {}, {}),
-    activity: cloneJson(asArray(source.activity), []).slice(0, 120),
-    resumePoint,
-    resumeStage: resumePoint.stage
-  };
-}
-
-export function upsertPipelineRunRecord(records, record, options = {}) {
-  const limit = options.limit || PIPELINE_RUN_HISTORY_LIMIT;
-  const incoming = normalizePipelineRunRecord(record);
-  const existing = asArray(records).find((item) => item.id === incoming.id);
-  const merged = existing
-    ? {
-        ...existing,
-        ...incoming,
-        createdAt: incoming.createdAt || existing.createdAt,
-        updatedAt: incoming.updatedAt || nowIso()
-      }
-    : incoming;
-  return [
-    merged,
-    ...asArray(records).filter((item) => item.id !== incoming.id)
-  ]
-    .sort((left, right) => String(right.updatedAt || right.createdAt).localeCompare(String(left.updatedAt || left.createdAt)))
-    .slice(0, limit);
-}
-
-export function mergePipelineRunHistories(...sources) {
-  let records = [];
-  for (const source of sources) {
-    for (const record of asArray(source)) {
-      records = upsertPipelineRunRecord(records, record);
-    }
-  }
-  return records;
-}
-
-export function canResumePipelineRun(record = {}) {
-  if (TERMINAL_SUCCESS.has(record.status)) return false;
-  if (RESUMABLE_STATUS.has(record.status)) return true;
-  return Object.values(record.outcomes || {}).some((outcome) => RESUMABLE_STATUS.has(outcome?.status));
-}
-
-export function blockedPhaseForPipelineError(error) {
-  const text = String(error || "");
-  if (/^build_|build.*timeout|build.*failed|build.*observe/i.test(text)) return "等待构建完成";
-  if (/^release_|^publish_|release.*timeout|publish.*timeout/i.test(text)) return "等待发布记录";
-  return "等待处理";
-}
-
-export function inferResumePoint(record = {}) {
-  const outcomes = record.outcomes || {};
-  const pointGroups = [BUILD_RESUME_POINTS, RELEASE_RESUME_POINTS];
-  for (const points of pointGroups) {
-    const point = points.find((definition) => {
-      const status = outcomes[definition.id]?.status;
-      return status === "failed" || status === "blocked" || status === "running";
-    });
-    if (!point) continue;
-    const outcome = outcomes[point.id];
-    return {
-      ...point,
-      status: outcome.status,
-      detail: outcome.detail || ""
-    };
-  }
-  if (outcomes.release?.status === "done") return { id: "complete", stage: "complete", phase: "完成", status: "done" };
-  if (record.buildSnapshot && (outcomes.build?.status === "done" || outcomes["build-observe"] || outcomes["build-platform-publish"])) {
-    return { id: "release-observe", stage: "release", phase: "等待发布记录", status: "pending" };
-  }
-  if (outcomes["create-task"]?.status === "done" || outcomes["build-task"]?.status === "done") {
-    return { id: "build", stage: "build", phase: "构建", status: "pending" };
-  }
-  if (record.status === "done") return { id: "complete", stage: "complete", phase: "完成", status: "done" };
-  return { id: "start", stage: "start", phase: "待启动", status: record.status || "draft" };
-}
-
-export function inferResumeStage(record = {}) {
-  return inferResumePoint(record).stage;
-}
-
-export function clonePipelineRunDraft(record = {}) {
-  const normalized = normalizePipelineRunRecord(record);
-  return {
-    templateId: normalized.templateId,
-    target: normalized.target,
-    releaseReason: normalized.releaseReason,
-    releaseNotice: normalized.releaseNotice,
-    serviceSnapshot: cloneJson(normalized.serviceSnapshot, [])
-  };
-}
-
-export function clonePipelineRunRecord(record = {}, options = {}) {
-  const normalized = normalizePipelineRunRecord(record);
-  const now = options.now || nowIso();
-  const id = options.id || `${Date.now()}`;
-  return normalizePipelineRunRecord({
-    id,
-    copiedFromRunId: normalized.id,
-    createdAt: now,
-    updatedAt: now,
-    completedAt: "",
-    started: false,
-    templateId: normalized.templateId,
-    status: "draft",
-    phase: "已复制",
-    target: normalized.target,
-    releaseReason: normalized.releaseReason,
-    releaseNotice: normalized.releaseNotice,
-    serviceSnapshot: cloneJson(normalized.serviceSnapshot, []),
-    buildSnapshot: null,
-    outcomes: {},
-    activity: [{
-      at: now,
-      title: "Pipeline 已复制",
-      detail: `复制自 Run ${normalized.id}`,
-      tone: "default"
-    }],
-    resumeStage: "start"
-  });
 }
 
 export function restorePipelineRunHistory(storage) {

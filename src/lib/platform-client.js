@@ -14,6 +14,8 @@ const REQUEST_DIR = path.join(CACHE_DIR, "requests");
 const SESSION_CACHE_PATH = path.join(CACHE_DIR, "session-cache.json");
 const HTTP_CONNECT_TIMEOUT_SECONDS = Number(process.env.WORKBENCH_HTTP_CONNECT_TIMEOUT_SECONDS || 3);
 const HTTP_MAX_TIME_SECONDS = Number(process.env.WORKBENCH_HTTP_MAX_TIME_SECONDS || 12);
+const HTTP_RETRY_ATTEMPTS = Math.max(1, Number(process.env.WORKBENCH_HTTP_RETRY_ATTEMPTS || 2));
+const HTTP_RETRY_DELAY_MS = Math.max(0, Number(process.env.WORKBENCH_HTTP_RETRY_DELAY_MS || 1200));
 const RELEASE_HTTP_CONNECT_TIMEOUT_SECONDS = Number(process.env.WORKBENCH_RELEASE_HTTP_CONNECT_TIMEOUT_SECONDS || 5);
 const RELEASE_HTTP_MAX_TIME_SECONDS = Number(process.env.WORKBENCH_RELEASE_HTTP_MAX_TIME_SECONDS || 35);
 const PUBLISH_RATE_INTERVAL_MS = Number(process.env.WORKBENCH_PUBLISH_RATE_INTERVAL_MS || 5000);
@@ -271,32 +273,63 @@ function parseNodeHttpResponse(result) {
   };
 }
 
-function classifyRequestError(error, options = {}) {
+function requestFailureStage(error) {
   const text = `${error && error.message || ""} ${error && error.stderr || ""} ${error && error.stdout || ""}`;
   const dnsFailed = /Could not resolve|Name or service not known|nodename nor servname provided|ENOTFOUND|EAI_AGAIN/i.test(text);
   const connectFailed = /Failed to connect|No route to host|Connection refused|Connection timed out|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH/i.test(text);
   const responseTimedOut = /timed out|Operation timed out|SSL connection timeout/i.test(text) || error && error.signal === "SIGTERM";
   const timedOut = error && (dnsFailed || connectFailed || responseTimedOut);
   const networkStage = dnsFailed ? "dns" : connectFailed ? "connect" : responseTimedOut ? "response" : null;
-  const connectTimeout = options.connectTimeoutSeconds || HTTP_CONNECT_TIMEOUT_SECONDS;
-  const maxTime = options.maxTimeSeconds || HTTP_MAX_TIME_SECONDS;
-  const message = timedOut
-    ? dnsFailed
-      ? `平台域名解析失败（connect=${connectTimeout}s, total=${maxTime}s），请检查 DNS、VPN 或 hosts。`
-      : connectFailed
-        ? `Workbench 后台进程无法连接平台（connect=${connectTimeout}s, total=${maxTime}s）。如果浏览器已可访问，通常是后台进程启动早于 VPN 路由刷新；请重启 Workbench 后重试。`
-        : `平台响应超时（connect=${connectTimeout}s, total=${maxTime}s）。VPN 可能可达，但接口响应超过本地保护阈值。`
-    : (error && error.message) || "平台请求失败";
   return {
-    reason: timedOut ? "network_timeout" : "request_failed",
-    networkStage,
-    message,
-    error: (error && error.message) || String(error),
-    timedOut: Boolean(timedOut)
+    text,
+    dnsFailed,
+    connectFailed,
+    responseTimedOut,
+    timedOut: Boolean(timedOut),
+    networkStage
   };
 }
 
-function postJsonViaNode(url, payload, cookieJar, options = {}) {
+function retryText(error) {
+  const attempts = Number(error && error.requestAttempts || 0);
+  if (!Number.isFinite(attempts) || attempts <= 1) return "";
+  return `，已自动重试 ${attempts - 1} 次`;
+}
+
+function shouldRetryRequestError(error) {
+  if (!error || error.code === "EMAXBUFFER") return false;
+  return requestFailureStage(error).timedOut;
+}
+
+function retryAttemptsFor(options = {}) {
+  const attempts = Number(options.retryAttempts || HTTP_RETRY_ATTEMPTS);
+  return Number.isFinite(attempts) && attempts > 0 ? Math.max(1, Math.floor(attempts)) : 1;
+}
+
+function classifyRequestError(error, options = {}) {
+  const failure = requestFailureStage(error);
+  const connectTimeout = options.connectTimeoutSeconds || HTTP_CONNECT_TIMEOUT_SECONDS;
+  const maxTime = options.maxTimeSeconds || HTTP_MAX_TIME_SECONDS;
+  const retried = retryText(error);
+  const message = failure.timedOut
+    ? failure.dnsFailed
+      ? `平台域名解析失败（connect=${connectTimeout}s, total=${maxTime}s${retried}）请检查 DNS、VPN 或 hosts；浏览器可访问不一定代表后台进程当前解析可用。`
+      : failure.connectFailed
+        ? `Workbench 后台进程仍无法连接平台（connect=${connectTimeout}s, total=${maxTime}s${retried}）。通常是后台 Node 进程到平台的网络路径、代理、DNS 或连接握手暂不可用；可直接重试当前操作，持续失败再重启 Workbench 以重新建立后台网络会话。`
+        : `平台响应超时（connect=${connectTimeout}s, total=${maxTime}s${retried}）。后台已发起请求但平台接口未在保护阈值内返回；可能是平台慢响应或网络抖动，可稍后重试。`
+    : (error && error.message) || "平台请求失败";
+  return {
+    reason: failure.timedOut ? "network_timeout" : "request_failed",
+    networkStage: failure.networkStage,
+    message,
+    error: (error && error.message) || String(error),
+    timedOut: Boolean(failure.timedOut),
+    requestAttempts: Number(error && error.requestAttempts || 1),
+    retryAttempts: Number(error && error.requestAttempts || 1) - 1
+  };
+}
+
+function postJsonViaNodeOnce(url, payload, cookieJar, options = {}) {
   const connectTimeoutSeconds = Number(options.connectTimeoutSeconds || HTTP_CONNECT_TIMEOUT_SECONDS);
   const maxTimeSeconds = Number(options.maxTimeSeconds || HTTP_MAX_TIME_SECONDS);
   const maxBufferBytes = Number(options.maxBufferBytes || 30 * 1024 * 1024);
@@ -360,6 +393,31 @@ function postJsonViaNode(url, payload, cookieJar, options = {}) {
   return parseNodeHttpResponse(result);
 }
 
+function postJsonViaNode(url, payload, cookieJar, options = {}) {
+  const attempts = retryAttemptsFor(options);
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs || HTTP_RETRY_DELAY_MS));
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return postJsonViaNodeOnce(url, payload, cookieJar, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !shouldRetryRequestError(error)) {
+        error.requestAttempts = attempt;
+        throw error;
+      }
+      sleepSync(retryDelayMs * attempt);
+    }
+  }
+
+  if (lastError) {
+    lastError.requestAttempts = attempts;
+    throw lastError;
+  }
+  throw new Error("Platform request failed");
+}
+
 function sleepSync(ms) {
   const normalized = Number(ms);
   if (!Number.isFinite(normalized) || normalized <= 0) return;
@@ -393,6 +451,95 @@ function compactObject(value) {
     }
   }
   return result;
+}
+
+function compactStructureStage(stage = {}) {
+  return {
+    id: stage.id || "",
+    name: stage.name || stage.stageName || "",
+    status: stage.status || "",
+    durationMillis: Number(stage.durationMillis || stage.duration || 0),
+    startTimeMillis: Number(stage.startTimeMillis || 0)
+  };
+}
+
+function compactStructureBuildRecord(record = {}) {
+  return {
+    id: record.id || "",
+    name: record.name || (record.id ? `#${record.id}` : ""),
+    status: record.status || "",
+    imageVersion: record.imageVersion || "",
+    buildByName: record.buildByName || "",
+    buildPerId: record.buildPerId || "",
+    startTimeMillis: Number(record.startTimeMillis || 0),
+    endTimeMillis: Number(record.endTimeMillis || 0),
+    durationMillis: Number(record.durationMillis || 0),
+    accessAddr: record.accessAddr || "",
+    stages: arrayOf(record.stages).map(compactStructureStage)
+  };
+}
+
+function structureDetailOf(response) {
+  const json = response && response.json || {};
+  const object = objectOf(response);
+  const message = object && typeof object === "object" && object.msg && typeof object.msg === "object"
+    ? object.msg
+    : json.msg && typeof json.msg === "object"
+      ? json.msg
+      : object && typeof object === "object"
+        ? object
+        : {};
+  return {
+    code: object && object.code || json.code || "",
+    avg: arrayOf(message.avg).map((row) => ({
+      stageName: row.stageName || row.name || "",
+      duration: Number(row.duration || row.durationMillis || 0)
+    })),
+    pineLines: arrayOf(message.pineLines).map(compactStructureBuildRecord)
+  };
+}
+
+function normalizeBuildNumber(value) {
+  const match = String(value || "").match(/#?\s*(\d+)/);
+  return match ? match[1] : "";
+}
+
+function normalizeCandidateBuildIds(values) {
+  return arrayOf(values)
+    .map(normalizeBuildNumber)
+    .filter(Boolean)
+    .filter((value, index, list) => list.indexOf(value) === index);
+}
+
+function structureDetailHasCandidate(structureDetail = {}, candidateBuildIds = []) {
+  if (!candidateBuildIds.length) return true;
+  const candidates = new Set(candidateBuildIds);
+  return arrayOf(structureDetail.pineLines).some((record) =>
+    candidates.has(normalizeBuildNumber(record.id || record.name || record.buildID || record.buildId))
+  );
+}
+
+function buildLogTextOf(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  const text = value.consoleText || value.text || value.log || value.msg || value.message || value.content;
+  if (typeof text === "string") return text;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
+function buildLogUnavailableMessage(value) {
+  if (!value || typeof value !== "object") return "";
+  if (value.code != null && String(value.code) !== "200") {
+    return value.errMsg || value.message || value.msg || `构建日志暂不可用（code=${value.code}）`;
+  }
+  if (value.status != null && String(value.status) === "0") {
+    return value.errMsg || value.message || value.msg || "构建日志暂不可用";
+  }
+  return "";
 }
 
 function compactBuildTask(row) {
@@ -1751,41 +1898,61 @@ function probeBuildServiceDetail(credentials, options = {}) {
     };
   }
 
-  try {
-    const detail = postJsonViaNode(
-      `${platforms.build.apiBase}/support/getStructureImageDetail`,
-      createWrapper(payload),
-      session.cookieJar
+	  try {
+	    const detail = postJsonViaNode(
+	      `${platforms.build.apiBase}/support/getStructureImageDetail`,
+	      createWrapper(payload),
+	      session.cookieJar
     );
     const detailRows = arrayOf(objectOf(detail)).map(compactObject);
-    const firstDetail = detailRows[0] || {};
-    const historyPayload = {
-      customerNameEn: options.customerNameEn,
-      codeBranch: options.codeBranch,
-      applicationName: options.applicationCode,
-      imageJenkinsName: options.imageJenkinsName,
-      imageVersion: options.imageVersion || firstDetail.imageVersion
-    };
-    let history = null;
+	    const firstDetail = detailRows[0] || {};
+	    const historyPayload = {
+	      customerNameEn: options.customerNameEn,
+	      codeBranch: options.codeBranch,
+	      applicationName: options.applicationCode,
+	      imageJenkinsName: options.imageJenkinsName
+	    };
+	    const candidateBuildIds = normalizeCandidateBuildIds(options.candidateBuildIds);
+	    if (options.imageVersion || firstDetail.imageVersion) {
+	      historyPayload.imageVersion = options.imageVersion || firstDetail.imageVersion;
+	    }
+	    let history = null;
+	    let structureDetail = { code: "", avg: [], pineLines: [] };
 
-    if (historyPayload.imageVersion) {
-      history = postJsonViaNode(
-        `${platforms.build.apiBase}/support/getStructureDetailList`,
-        createWrapper(historyPayload),
-        session.cookieJar
-      );
-    }
+    history = postJsonViaNode(
+      `${platforms.build.apiBase}/support/getStructureDetailList`,
+      createWrapper(historyPayload),
+	      session.cookieJar
+	    );
+	    structureDetail = structureDetailOf(history);
+	    if (candidateBuildIds.length && !structureDetailHasCandidate(structureDetail, candidateBuildIds)) {
+	      history = postJsonViaNode(
+	        `${platforms.build.apiBase}/support/getStructureDetailList`,
+	        createWrapper({
+	          customerNameEn: options.customerNameEn,
+	          codeBranch: options.codeBranch,
+	          applicationName: options.applicationCode,
+	          imageJenkinsName: options.imageJenkinsName
+	        }),
+	        session.cookieJar
+	      );
+	      const candidateStructureDetail = structureDetailOf(history);
+	      if (structureDetailHasCandidate(candidateStructureDetail, candidateBuildIds)) {
+	        structureDetail = candidateStructureDetail;
+	      }
+	    }
 
-    return {
-      ok: true,
-      session: session.login,
+	    return {
+	      ok: true,
+	      session: session.login,
       service: {
         applicationCode: options.applicationCode,
         codeBranch: options.codeBranch,
         imageJenkinsName: options.imageJenkinsName
       },
       detail: detailRows,
-      history: history ? arrayOf(objectOf(history)).slice(0, 10).map(compactObject) : [],
+      structureDetail,
+      history: structureDetail.pineLines.slice(0, 10),
       blockedMutations: [
         "/support/buildImages",
         "/support/stopBuildImages",
@@ -1812,15 +1979,45 @@ function probeBuildLog(credentials, options = {}) {
   const session = loginBuildPlatform(credentials);
   if (!session.ok) return { ok: false, session };
 
-  const payload = {
+  const candidateBuildIds = [];
+  const addCandidate = (value, options = {}) => {
+    const normalized = String(value || "").replace(/^#/, "").trim();
+    if (!normalized || candidateBuildIds.includes(normalized)) return;
+    if (options.prefer) {
+      candidateBuildIds.unshift(normalized);
+    } else {
+      candidateBuildIds.push(normalized);
+    }
+  };
+  addCandidate(options.buildID || options.buildId);
+  arrayOf(options.candidateBuildIds).forEach(addCandidate);
+
+  const payloadBase = {
     customerNameEn: options.customerNameEn,
     codeBranch: options.codeBranch,
     applicationName: options.applicationCode,
-    imageJenkinsName: options.imageJenkinsName,
-    buildID: String(options.buildID || options.buildId || "").replace(/^#/, "")
+    imageJenkinsName: options.imageJenkinsName
   };
+  const expectedVersion = String(options.expectedVersion || "").trim();
 
-  if (!payload.customerNameEn || !payload.codeBranch || !payload.applicationName || !payload.imageJenkinsName || !payload.buildID) {
+  if (payloadBase.customerNameEn && payloadBase.codeBranch && payloadBase.applicationName && payloadBase.imageJenkinsName && expectedVersion) {
+    try {
+      const history = postJsonViaNode(
+        `${platforms.build.apiBase}/support/getStructureDetailList`,
+        createWrapper({ ...payloadBase, imageVersion: expectedVersion }),
+        session.cookieJar
+      );
+      const structureDetail = structureDetailOf(history);
+      const matchedRecord = arrayOf(structureDetail.pineLines).find((record) =>
+        String(record?.imageVersion || "").trim() === expectedVersion
+      );
+      addCandidate(matchedRecord && (matchedRecord.id || matchedRecord.name || matchedRecord.buildID || matchedRecord.buildId), { prefer: true });
+    } catch {
+      // Fall through to the explicit build id/candidate list below.
+    }
+  }
+
+  if (!payloadBase.customerNameEn || !payloadBase.codeBranch || !payloadBase.applicationName || !payloadBase.imageJenkinsName || !candidateBuildIds.length) {
     removeCookieJar(session.cookieJar);
     return {
       ok: false,
@@ -1830,25 +2027,61 @@ function probeBuildLog(credentials, options = {}) {
   }
 
   try {
-    const log = postJsonViaNode(
-      `${platforms.build.apiBase}/support/getStructureLog`,
-      createWrapper(payload),
-      session.cookieJar,
-      { maxTimeSeconds: Math.max(HTTP_MAX_TIME_SECONDS, 30) }
-    );
-    const object = objectOf(log);
+    let lastUnavailable = "";
+    for (const buildID of candidateBuildIds) {
+      const payload = { ...payloadBase, buildID };
+      const log = postJsonViaNode(
+        `${platforms.build.apiBase}/support/getStructureLog`,
+        createWrapper(payload),
+        session.cookieJar,
+        { maxTimeSeconds: Math.max(HTTP_MAX_TIME_SECONDS, 30) }
+      );
+      const object = objectOf(log);
+      const unavailable = buildLogUnavailableMessage(object);
+      const logText = buildLogTextOf(object);
+      if (unavailable) {
+        lastUnavailable = unavailable;
+        continue;
+      }
+      if (expectedVersion && logText && !logText.includes(expectedVersion)) {
+        lastUnavailable = `候选构建 #${buildID} 与目标版本 ${expectedVersion} 不匹配`;
+        continue;
+      }
+      return {
+        ok: true,
+        session: session.login,
+        service: {
+          applicationCode: options.applicationCode,
+          codeBranch: options.codeBranch,
+          imageJenkinsName: options.imageJenkinsName,
+          buildID: payload.buildID
+        },
+        payload: {
+          ...payload,
+          expectedVersion,
+          candidateBuildIds
+        },
+        log: typeof object === "string" ? object : object,
+        response: responseSummary(log)
+      };
+    }
     return {
-      ok: true,
+      ok: false,
       session: session.login,
       service: {
         applicationCode: options.applicationCode,
         codeBranch: options.codeBranch,
         imageJenkinsName: options.imageJenkinsName,
-        buildID: payload.buildID
+        buildID: candidateBuildIds[0] || ""
       },
-      payload,
-      log: typeof object === "string" ? object : object,
-      response: responseSummary(log)
+      payload: {
+        ...payloadBase,
+        buildID: candidateBuildIds[0] || "",
+        expectedVersion,
+        candidateBuildIds
+      },
+      reason: "build_log_not_ready",
+      message: lastUnavailable || "构建日志尚未生成或暂不可读"
     };
   } catch (error) {
     return {
@@ -1858,7 +2091,7 @@ function probeBuildLog(credentials, options = {}) {
         applicationCode: options.applicationCode,
         codeBranch: options.codeBranch,
         imageJenkinsName: options.imageJenkinsName,
-        buildID: payload.buildID
+        buildID: candidateBuildIds[0] || ""
       },
       ...classifyRequestError(error, { maxTimeSeconds: Math.max(HTTP_MAX_TIME_SECONDS, 30) })
     };
@@ -2959,6 +3192,40 @@ function probeReleasePlatform(credentials, options = "demo-customer-a") {
   }
 }
 
+function discoverReleaseWorkflowCustomers(credentials, options = {}) {
+  const customerNameEn = options.customerNameEn || "";
+  const session = loginReleasePlatform(credentials);
+  if (!session.ok) return { ok: false, session, reason: session.reason, message: session.message || session.login && session.login.message };
+
+  try {
+    const customers = postJsonViaNode(`${platforms.releaseApi.apiBase}/cloud/getCustomerListAuth`, createWrapper({}), session.cookieJar, releaseRequestOptions);
+    const customerList = arrayOf(objectOf(customers)).map(compactObject).filter((item) => item.customerNameEn || item.customerNameCh);
+    const matched = customerNameEn
+      ? customerList.filter((item) => item.customerNameEn === customerNameEn || String(item.customerNameEn || "").includes(customerNameEn))
+      : [];
+    return {
+      ok: true,
+      session: session.login,
+      customers: customerList,
+      matched,
+      customerNameEn,
+      note: "轻量 workflow 初始化只校验发布平台客户授权，不读取发布总览。"
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      session: session.login,
+      platform: {
+        shell: platforms.releaseShell,
+        api: platforms.releaseApi
+      },
+      ...classifyRequestError(error, releaseRequestOptions)
+    };
+  } finally {
+    removeCookieJar(session.cookieJar);
+  }
+}
+
 function getCurrentAppPublishDetail(credentials, options = {}) {
   const session = loginReleasePlatform(credentials);
   if (!session.ok) return { ok: false, session, reason: session.reason, message: session.message || session.login && session.login.message };
@@ -3093,6 +3360,7 @@ module.exports = {
   executeBuildTask,
   executePublishApps,
   discoverBuildWorkflowCustomers,
+  discoverReleaseWorkflowCustomers,
   getCurrentAppPublishDetail,
   probeBuildApply,
   listBuildTasks,

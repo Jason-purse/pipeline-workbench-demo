@@ -11,6 +11,13 @@ const timeout = _internals.classifyRequestError(
 assert.strictEqual(timeout.reason, "network_timeout", "curl connect timeouts are classified as network timeouts");
 assert.match(timeout.message, /无法连接平台|响应超时|域名解析失败/, "timeout message is human-readable");
 assert.doesNotMatch(timeout.message, /curl --noproxy/, "timeout message must not expose raw curl commands");
+assert.doesNotMatch(timeout.message, /通常是后台进程启动早于 VPN 路由刷新/, "network timeout messages must not over-attribute every failure to VPN route refresh");
+
+const retriedTimeout = _internals.classifyRequestError(
+  Object.assign(new Error("Failed to connect to supportweb.example after 3075 ms: Timeout was reached"), { requestAttempts: 2 }),
+  { connectTimeoutSeconds: 3, maxTimeSeconds: 12 }
+);
+assert.match(retriedTimeout.message, /已自动重试 1 次/, "final network timeout message should say automatic retry already happened");
 
 assert.strictEqual(_internals.isSuccessLikePlatformMessage("消息处理成功"), true, "release platform success text is recognized");
 assert.match(

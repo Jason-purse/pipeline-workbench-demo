@@ -24,7 +24,17 @@ assert.match(
 assert.match(
   serverSource,
   /initializeCustomWorkflow/,
-  "workflow creation endpoint must initialize customer applications, release environments, and account metadata"
+  "workflow creation endpoint must initialize release environments and account metadata"
+);
+assert.match(
+  serverSource,
+  /discoverReleaseWorkflowCustomers/,
+  "workflow creation should lightly verify release-platform customer access"
+);
+assert.match(
+  serverSource,
+  /pending_release_probe/,
+  "workflow creation should save a pending record and defer release overview hydration"
 );
 assert.match(
   serverSource,

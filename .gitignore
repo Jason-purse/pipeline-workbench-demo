@@ -16,3 +16,5 @@ docs/task-anchors/
 AGENTS.md
 .DS_Store
 *.log
+.gstack/
+.gitnexus
