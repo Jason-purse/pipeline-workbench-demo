@@ -33,6 +33,7 @@ const {
   executeBuildTask,
   executePublishApps,
   discoverBuildWorkflowCustomers,
+  discoverReleaseWorkflowCustomers,
   getCurrentAppPublishDetail,
   listBuildTasks,
   probeBuildApply,
@@ -118,29 +119,53 @@ function epochMs(value) {
   return Number.isFinite(time) ? time : 0;
 }
 
+function isLegacyPipelineRunRecord(record = {}) {
+  if (Number(record.schemaVersion || 0) === 2 && record.memento && Array.isArray(record.commands)) return false;
+  return Object.prototype.hasOwnProperty.call(record, "outcomes") ||
+    Object.prototype.hasOwnProperty.call(record, "resumeStage");
+}
+
 function normalizeRunHistoryRecord(record = {}) {
   const timestamp = new Date().toISOString();
   const createdAt = String(record.createdAt || timestamp);
   const updatedAt = String(record.updatedAt || createdAt);
   const id = String(record.id || createdAt);
+  const target = cloneJson(record.target || record.context?.target || {}, {});
+  const releaseReason = String(record.context?.inputs?.releaseReason || record.releaseReason || "功能更新");
+  const releaseNotice = String(record.context?.inputs?.releaseNotice || record.releaseNotice || "测试");
+  const legacyV1 = isLegacyPipelineRunRecord(record);
   return {
+    schemaVersion: 2,
     id,
     copiedFromRunId: String(record.copiedFromRunId || ""),
     createdAt,
-    updatedAt,
+    updatedAt: legacyV1 ? timestamp : updatedAt,
     completedAt: String(record.completedAt || ""),
     started: record.started !== false,
     templateId: String(record.templateId || "build-and-release"),
-    status: String(record.status || "draft"),
-    phase: String(record.phase || "待选择"),
-    target: cloneJson(record.target || {}, {}),
-    releaseReason: String(record.releaseReason || "功能更新"),
-    releaseNotice: String(record.releaseNotice || "测试"),
+    status: legacyV1 ? "cancelled" : String(record.status || "draft"),
+    phase: legacyV1 ? "历史 Run 格式不兼容" : String(record.phase || "待选择"),
+    target,
+    releaseReason,
+    releaseNotice,
     serviceSnapshot: cloneJson(asArray(record.serviceSnapshot), []),
-    buildSnapshot: cloneJson(record.buildSnapshot || null, null),
-    outcomes: cloneJson(record.outcomes || {}, {}),
-    activity: cloneJson(asArray(record.activity), []).slice(0, 120),
-    resumeStage: String(record.resumeStage || "")
+    context: cloneJson(record.context || {
+      target,
+      inputs: { releaseReason, releaseNotice },
+      data: {}
+    }, {}),
+    commands: cloneJson(asArray(record.commands), []),
+    memento: cloneJson(record.memento || {
+      cursor: { commandId: "", index: 0, status: "pending", phase: "待选择", detail: "" },
+      order: [],
+      commands: {}
+    }, {}),
+    activity: (legacyV1 ? [{
+      at: timestamp,
+      title: "历史 Run 不兼容",
+      detail: "旧 outcomes/resumeStage 历史记录不能通过 PipelineRun v2 继续；请复制配置后生成新的 Run。",
+      tone: "warning"
+    }] : []).concat(cloneJson(asArray(record.activity), [])).slice(0, 120)
   };
 }
 
@@ -171,7 +196,7 @@ function writePipelineRunHistory(records) {
   const runs = sortAndLimitRunHistory(records);
   fs.mkdirSync(path.dirname(RUN_HISTORY_PATH), { recursive: true, mode: 0o700 });
   fs.writeFileSync(RUN_HISTORY_PATH, `${JSON.stringify({
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
     limit: RUN_HISTORY_LIMIT,
     runs
@@ -340,24 +365,12 @@ function releaseEnvironmentsFromProbe(profileId, releaseResult) {
     .filter(Boolean);
 }
 
-function applicationsFromProbes(buildResult, releaseEnvironments) {
+function applicationsFromReleaseEnvironments(releaseEnvironments) {
   const byCode = new Map();
-  const customerApps = buildResult.customerApplications?.rows || [];
-  for (const item of customerApps) {
-    const code = item.applicationCode || item.code || item.applicationName;
-    if (!code) continue;
-    byCode.set(code, { code, name: item.applicationName || item.name || code });
-  }
   for (const env of releaseEnvironments || []) {
     for (const code of Object.keys(env.apps || {})) {
       if (!byCode.has(code)) byCode.set(code, { code, name: code });
     }
-  }
-  const discoveredApps = buildResult.serviceDiscovery || [];
-  for (const item of discoveredApps) {
-    const code = item.applicationCode || item.applicationName;
-    if (!code || byCode.has(code)) continue;
-    byCode.set(code, { code, name: item.applicationName || code });
   }
   return Array.from(byCode.values());
 }
@@ -379,6 +392,33 @@ function saveInitializedWorkflowProfile(profile, account, credentials) {
   ];
   writeSecrets({ ...secrets, customWorkflowProfiles: nextProfiles, hiddenWorkflowProfileIds: Array.from(hiddenProfileIds) });
   setStoredAccount(profile.id, account.id, credentials);
+}
+
+function updateWorkflowProfileFromReleaseProbe(profile, releaseResult) {
+  if (!profile?.customWorkflow && !profile?.accounts?.some((account) => account.customWorkflow)) return null;
+  if (!releaseResult?.ok) return null;
+  const releaseEnvironments = releaseEnvironmentsFromProbe(profile.id, releaseResult);
+  if (!releaseEnvironments.length) return null;
+  const secrets = readSecrets();
+  const dynamicProfiles = Array.isArray(secrets.customWorkflowProfiles) ? secrets.customWorkflowProfiles : [];
+  const nextProfile = {
+    ...profile,
+    applications: applicationsFromReleaseEnvironments(releaseEnvironments),
+    releaseEnvironments,
+    environmentLinks: environmentLinksForReleaseEnvironments(releaseEnvironments),
+    workflowInitState: {
+      status: "release_ready",
+      updatedAt: new Date().toISOString()
+    }
+  };
+  writeSecrets({
+    ...secrets,
+    customWorkflowProfiles: [
+      ...dynamicProfiles.filter((item) => item.id !== profile.id),
+      nextProfile
+    ]
+  });
+  return activeProfile(profile.id);
 }
 
 function codedError(message, code) {
@@ -433,33 +473,25 @@ function initializeCustomWorkflow(body = {}) {
   }
 
   const credentials = { username, password };
-  const buildResult = probeBuildPlatform(credentials, { customerNameEn, fast: false });
-  if (!buildResult.ok) {
-    const error = new Error(buildResult.message || buildResult.error || "构建平台客户初始化失败");
-    error.code = buildResult.reason || "build_workflow_probe_failed";
+  const releaseDiscovery = discoverReleaseWorkflowCustomers(credentials, { customerNameEn });
+  if (!releaseDiscovery.ok) {
+    const error = new Error(releaseDiscovery.message || releaseDiscovery.error || "发布平台客户授权校验失败");
+    error.code = releaseDiscovery.reason || "release_workflow_customer_discovery_failed";
     throw error;
   }
-  const releaseResult = probeReleasePlatform(credentials, { customerNameEn, fast: true });
-  if (!releaseResult.ok) {
-    const error = new Error(releaseResult.message || releaseResult.error || "发布平台环境初始化失败");
-    error.code = releaseResult.reason || "release_workflow_probe_failed";
+  if (!releaseDiscovery.matched?.length) {
+    const error = new Error("发布平台账号未返回该客户，无法建立 workflow。");
+    error.code = "release_customer_not_found";
     throw error;
   }
-
   const profileId = uniqueWorkflowProfileId(customerNameEn);
-  const releaseEnvironments = releaseEnvironmentsFromProbe(profileId, releaseResult);
-  if (!releaseEnvironments.length) {
-    const error = new Error("发布平台未返回该客户的环境，无法建立构建/发布环境映射。");
-    error.code = "release_environments_not_found";
-    throw error;
-  }
   const accountId = uniqueWorkflowAccountId({ accounts: [] }, username);
   const account = {
     id: accountId,
     label: username,
     username,
     secretMode: "editable",
-    staffCode: releaseResult.session?.staffCode || buildResult.session?.staffCode,
+    staffCode: releaseDiscovery.session?.staffCode,
     platforms: ["build", "release"],
     scopeNote: "本地初始化 workflow 账号。",
     createdAt: new Date().toISOString(),
@@ -471,19 +503,24 @@ function initializeCustomWorkflow(body = {}) {
     shortName: customerField(customer, ["customerCodeAbbreviation", "shortName", "customerNameCh", "label"]) || customerNameEn,
     customerNameEn,
     customerCodeAbbreviation: customerField(customer, ["customerCodeAbbreviation", "shortName"]) || customerNameEn,
-    ownerHint: "本地初始化 workflow。",
+    ownerHint: "本地初始化 workflow；发布环境会在进入工作台或刷新时读取。",
+    customWorkflow: true,
     accounts: [account],
-    applications: applicationsFromProbes(buildResult, releaseEnvironments),
-    releaseEnvironments,
-    environmentLinks: environmentLinksForReleaseEnvironments(releaseEnvironments)
+    applications: [],
+    releaseEnvironments: [],
+    environmentLinks: [],
+    workflowInitState: {
+      status: "pending_release_probe",
+      updatedAt: new Date().toISOString(),
+      note: "创建阶段只校验账号可见客户；发布环境和应用在工作台刷新时初始化。"
+    }
   };
 
   saveInitializedWorkflowProfile(profile, account, credentials);
   return {
     profile: activeProfile(profile.id),
     account,
-    buildResult,
-    releaseResult
+    releaseDiscovery
   };
 }
 
@@ -939,7 +976,8 @@ async function handleApi(req, res, pathname) {
         applicationCode: body.applicationCode,
         codeBranch: body.codeBranch,
         imageJenkinsName: body.imageJenkinsName,
-        imageVersion: body.imageVersion
+        imageVersion: body.imageVersion,
+        candidateBuildIds: body.candidateBuildIds
       })
     });
     return;
@@ -973,7 +1011,9 @@ async function handleApi(req, res, pathname) {
         applicationCode: body.applicationCode,
         codeBranch: body.codeBranch,
         imageJenkinsName: body.imageJenkinsName,
-        buildID: body.buildID || body.buildId
+        buildID: body.buildID || body.buildId,
+        candidateBuildIds: body.candidateBuildIds,
+        expectedVersion: body.expectedVersion
       })
     });
     return;
@@ -1261,13 +1301,17 @@ async function handleApi(req, res, pathname) {
       });
       return;
     }
+    const releaseResult = probeReleasePlatform(credentials, {
+      customerNameEn: body.customerNameEn || profile.customerNameEn,
+      fast: body.fast !== false
+    });
+    updateWorkflowProfileFromReleaseProbe(profile, releaseResult);
     sendJson(res, 200, {
       profileId: profile.id,
       accountId: body.accountId,
-      result: probeReleasePlatform(credentials, {
-        customerNameEn: body.customerNameEn || profile.customerNameEn,
-        fast: body.fast !== false
-      })
+      result: releaseResult,
+      profiles: activeProfiles(),
+      credentialState: credentialState()
     });
     return;
   }

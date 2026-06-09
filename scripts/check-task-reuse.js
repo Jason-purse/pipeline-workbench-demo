@@ -111,7 +111,8 @@ assert.strictEqual(timeout.timedOut, true);
 const connectTimeout = _internals.classifyRequestError({ message: "curl: (28) Failed to connect to supportweb.example port 80 after 3073 ms: Timeout was reached" }, { connectTimeoutSeconds: 3, maxTimeSeconds: 12 });
 assert.strictEqual(connectTimeout.reason, "network_timeout");
 assert.strictEqual(connectTimeout.networkStage, "connect");
-assert.match(connectTimeout.message, /后台进程无法连接平台/);
+assert.match(connectTimeout.message, /后台进程.*无法连接平台/);
+assert.doesNotMatch(connectTimeout.message, /重启 Workbench 后重试/, "restart should not be the first recovery instruction for a single connect timeout");
 
 const rawReleaseLoginMessage = "uuid:  invoke cc.ewell.authority.api.v3.service.IUserService#login was error, Zookeeper Can not be find any agents";
 const releaseLoginMessage = _internals.loginFailureMessage("发布 Shell", {

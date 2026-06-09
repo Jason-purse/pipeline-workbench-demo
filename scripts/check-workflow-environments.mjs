@@ -98,21 +98,23 @@ assert.doesNotMatch(
   /const buildApps = buildResult\.apps/,
   "initialized workflow applications must not be seeded from buildResult.apps because findCustomerAppList is a global dictionary"
 );
+const initializeCustomWorkflowBody = server.match(/function initializeCustomWorkflow\(body = \{\}\) \{[\s\S]*?\n\}/)?.[0] || "";
 assert.match(
   server,
-  /const customerApps = buildResult\.customerApplications\?\.rows/,
-  "initialized workflow applications should start from the original build-page customer application list"
+  /applicationsFromReleaseEnvironments/,
+  "release probe hydration should derive workflow applications from release platform environment apps"
 );
 assert.match(
   server,
   /for \(const env of releaseEnvironments/,
-  "initialized workflow applications may add customer-scoped release environments"
+  "release probe hydration should read customer-scoped release environment apps"
 );
-assert.match(
-  server,
-  /buildResult\.serviceDiscovery/,
-  "initialized workflow applications may add build-verified discovered apps"
+assert.doesNotMatch(
+  initializeCustomWorkflowBody,
+  /probeBuildPlatform|probeReleasePlatform|buildResult|releaseResult|serviceDiscovery|customerApplications|publishOverviewList/,
+  "workflow creation must stay lightweight and must not run build probes or release overview"
 );
 assert.match(platformClient, /discoverBuildWorkflowCustomers/, "platform client must expose build customer discovery for workflow initialization");
+assert.match(platformClient, /discoverReleaseWorkflowCustomers/, "platform client must expose lightweight release customer verification for workflow initialization");
 
 console.log("workflow environment checks passed");

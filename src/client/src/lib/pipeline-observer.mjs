@@ -125,6 +125,53 @@ function serviceNameOf(service) {
   return service?.imageJenkinsName || service?.imageNameEn || "unknown-service";
 }
 
+function buildDetailRowForService(service, detailResult) {
+  const rows = Array.isArray(detailResult?.detail) ? detailResult.detail : [];
+  return rows.find((item) =>
+    item.imageJenkinsName === service?.imageJenkinsName ||
+    item.imageNameEn === service?.imageNameEn
+  ) || rows[0] || null;
+}
+
+function markerIsNew(currentAt, baselineAt, currentId, baselineId) {
+  if (currentAt <= 0) return false;
+  if (currentAt > baselineAt) return true;
+  return currentAt === baselineAt && hasText(currentId) && hasText(baselineId) && String(currentId) !== String(baselineId);
+}
+
+function buildIdNumber(value) {
+  const match = String(value || "").match(/#?\s*(\d+)/);
+  const numeric = match ? Number(match[1]) : 0;
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function buildIdLabel(value) {
+  const numeric = Number(value || 0);
+  return Number.isFinite(numeric) && numeric > 0 ? `#${numeric}` : "";
+}
+
+function candidateBuildIdsFromMarkers(row, baseline, count = 3) {
+  const latest = Math.max(
+    buildIdNumber(row?.lastSuccessId),
+    buildIdNumber(row?.lastFailureId),
+    buildIdNumber(baseline?.lastSuccessId),
+    buildIdNumber(baseline?.lastFailureId)
+  );
+  if (!latest) return [];
+  return Array.from({ length: count }, (_, index) => buildIdLabel(latest + index + 1));
+}
+
+export function buildObservationBaselineForService(service, detailResult) {
+  const row = buildDetailRowForService(service, detailResult);
+  return {
+    imageVersion: row?.imageVersion || "",
+    lastSuccessTime: numberValue(row?.lastSuccessTime),
+    lastFailureTime: numberValue(row?.lastFailureTime),
+    lastSuccessId: row?.lastSuccessId || "",
+    lastFailureId: row?.lastFailureId || ""
+  };
+}
+
 export const BUILD_APPLY_STATUS = {
   pending: "0",
   running: "1",
@@ -235,27 +282,36 @@ export function buildPlatformPublishProgress({ branch, applySignal, confirmedEnv
   };
 }
 
-export function buildSignalForService(service, detailResult) {
-  const rows = Array.isArray(detailResult?.detail) ? detailResult.detail : [];
-  const row = rows.find((item) =>
-    item.imageJenkinsName === service?.imageJenkinsName ||
-    item.imageNameEn === service?.imageNameEn
-  ) || rows[0] || null;
+export function buildSignalForService(service, detailResult, options = {}) {
+  const row = buildDetailRowForService(service, detailResult);
   const targetVersion = service?.generatedVersion || service?.imageVersion || "";
   const actualVersion = row?.imageVersion || "";
-  const versionMatches = !targetVersion || actualVersion === targetVersion;
   const successAt = numberValue(row?.lastSuccessTime);
   const failureAt = numberValue(row?.lastFailureTime);
+  const baseline = options.baseline || null;
+  const baselineSuccessAt = baseline ? numberValue(baseline.lastSuccessTime) : 0;
+  const baselineFailureAt = baseline ? numberValue(baseline.lastFailureTime) : 0;
+  const successIsCurrent = baseline
+    ? markerIsNew(successAt, baselineSuccessAt, row?.lastSuccessId, baseline.lastSuccessId)
+    : successAt > 0;
+  const failureIsCurrent = baseline
+    ? markerIsNew(failureAt, baselineFailureAt, row?.lastFailureId, baseline.lastFailureId)
+    : failureAt > 0;
+  const postBaselineVersion = baseline && actualVersion && actualVersion !== baseline.imageVersion && (successIsCurrent || failureIsCurrent);
+  const versionMatches = !targetVersion || actualVersion === targetVersion || postBaselineVersion;
+  const candidateBuildIds = candidateBuildIdsFromMarkers(row, baseline);
 
   if (!row) {
     return {
       service: serviceNameOf(service),
       status: "running",
-      reason: "missing_build_detail"
+      reason: "missing_build_detail",
+      candidateBuildId: candidateBuildIds[0] || "",
+      candidateBuildIds
     };
   }
 
-  if (versionMatches && failureAt > successAt) {
+  if (versionMatches && failureIsCurrent && failureAt > successAt) {
     return {
       service: serviceNameOf(service),
       status: "failed",
@@ -266,7 +322,7 @@ export function buildSignalForService(service, detailResult) {
     };
   }
 
-  if (versionMatches && successAt > 0) {
+  if (versionMatches && successIsCurrent) {
     return {
       service: serviceNameOf(service),
       status: "succeeded",
@@ -280,7 +336,9 @@ export function buildSignalForService(service, detailResult) {
     service: serviceNameOf(service),
     status: "running",
     version: actualVersion,
-    reason: versionMatches ? "waiting_for_success" : "waiting_for_target_version"
+    reason: versionMatches ? "waiting_for_success" : "waiting_for_target_version",
+    candidateBuildId: candidateBuildIds[0] || "",
+    candidateBuildIds
   };
 }
 
